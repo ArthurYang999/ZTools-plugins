@@ -15,12 +15,24 @@ import Toast from './Toast.vue'
 import Modal from './Modal.vue'
 import BookInfoModal from './BookInfoModal.vue'
 import ThemeToggle from './ThemeToggle.vue'
+import OnlineSearchModal from './OnlineSearchModal.vue'
+import { fetchChapterMenu } from '../../utils/onlineBook'
+import { useOnlineStore } from '../../stores/online'
 
 const props = defineProps<{ enterAction?: any }>()
 
 const bookStore = useBookStore()
 const configStore = useConfigStore()
 const readerStore = useReaderStore()
+const onlineStore = useOnlineStore()
+
+/** Cookie Jar 上下文：书架内拉取目录时自动携带/保存书源域名 Cookie */
+function buildCookieCtx() {
+  return {
+    getCookie: (url: string) => onlineStore.jarCookie(url),
+    saveCookies: (url: string, cookies: string[]) => onlineStore.saveJarCookies(url, cookies)
+  }
+}
 
 const openBookAndHushreader = inject<(id: string) => void>('openBookAndHushreader')
 const hideHushreaderWindow = inject<() => void>('hideHushreaderWindow')
@@ -32,6 +44,20 @@ function handleHideHushreaderWindow() {
 
 const showSettings = ref(false)
 const isLoading = ref(false)
+const showOnlineSearch = ref(false)
+
+function isOnlineBook(book: any) {
+  return book?.format === 'online'
+}
+
+function bookToOnlineRef(book: any) {
+  return {
+    id: book.id,
+    bookUrl: book.bookUrl || '',
+    onlineKind: book.onlineKind || 'source',
+    source: book.source
+  }
+}
 
 // Toast
 const toastMsg = ref('')
@@ -88,7 +114,11 @@ async function openChapterList(bookId: string) {
   chapterListCurrentIndex.value = book.lastChapter ?? -1
 
   try {
-    if (book.format === 'txt') {
+    if (book.format === 'online') {
+      const menu = await fetchChapterMenu(bookToOnlineRef(book), { cookie: buildCookieCtx() })
+      chapterListItems.value = menu.map((m, i) => ({ index: i, title: m.title || `第${i + 1}章` }))
+      chapterListCurrentIndex.value = book.lastChapter ?? -1
+    } else if (book.format === 'txt') {
       const text = window.services?.readFile(book.filePath) ?? ''
       const chapters = parseTxt(text, configStore.config.other.chapterRegex || undefined)
       chapterListItems.value = chapters.map(c => ({ index: c.index, title: c.title }))
@@ -128,7 +158,7 @@ function jumpToChapter(chapterIndex: number) {
   showChapterList.value = false
   const bookId = chapterListBookId.value
   if (!bookId) return
-  bookStore.updateBook(bookId, { lastChapter: chapterIndex, lastPage: 0 })
+  bookStore.updateBook(bookId, { lastChapter: chapterIndex, lastPage: 0, progressIndex: 0 })
   openBookAndHushreader?.(bookId)
 }
 
@@ -434,6 +464,20 @@ function confirmDelete() {
 async function reloadMetadata(bookId: string, silent = false) {
   const book = bookStore.books.find(b => b.id === bookId)
   if (!book) return
+
+  // 在线书籍：重刷章节列表以更新章节数
+  if (book.format === 'online') {
+    try {
+      const menu = await fetchChapterMenu(bookToOnlineRef(book), { cookie: buildCookieCtx() })
+      bookStore.updateBook(bookId, { totalChapters: menu.length, updatedAt: Date.now(), customCoverImage: undefined })
+      removeCustomCover(bookId).catch(() => { })
+      if (!silent) toast(`《${book.title}》元数据已重载`, 'success')
+    } catch (e: any) {
+      if (!silent) toast(`重载失败：${e.message}`, 'error')
+      throw e
+    }
+    return
+  }
 
   try {
     let title = book.title
@@ -1250,6 +1294,13 @@ function formatReadingTime(ms: number): string {
             <line x1="1" y1="1" x2="23" y2="23" />
           </svg>
         </button>
+        <button class="icon-btn" title="在线搜书" @click="showOnlineSearch = true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="2" y1="12" x2="22" y2="12" />
+            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+          </svg>
+        </button>
         <button class="icon-btn" title="设置" @click="showSettings = true">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3" />
@@ -1322,6 +1373,7 @@ function formatReadingTime(ms: number): string {
     <!-- Context Menu -->
     <ContextMenu v-if="contextMenuBook" :pos="contextMenuPos"
       :is-finished="!!bookStore.books.find(b => b.id === contextMenuBook)?.finishedAt"
+      :is-online="isOnlineBook(bookStore.books.find(b => b.id === contextMenuBook))"
       @book-info="openBookInfo(contextMenuBook!)" @chapter-list="openChapterList(contextMenuBook!)"
       @bookmark-list="openBookmarkList(contextMenuBook!)" @search-jump="openSearchModal(contextMenuBook!)"
       @change-path="openPathModal(contextMenuBook!)" @open-file-location="openFileLocation(contextMenuBook!)"
@@ -1332,6 +1384,9 @@ function formatReadingTime(ms: number): string {
 
     <!-- Settings Modal -->
     <SettingsModal v-if="showSettings" @close="showSettings = false" />
+
+    <!-- Online Search Modal -->
+    <OnlineSearchModal v-if="showOnlineSearch" @close="showOnlineSearch = false" />
 
     <!-- Chapter List Modal -->
     <Modal v-if="showChapterList" title="章节列表" @close="showChapterList = false">

@@ -9,6 +9,10 @@ import { parseTxt } from './utils/txtParser'
 import { parseEpub } from './utils/epubParser'
 import { parseMobi } from './utils/mobiParser'
 import { loadChapters, saveChapters } from './utils/db'
+import { useOnlineStore } from './stores/online'
+import { useReplaceStore } from './stores/replace'
+import { fetchChapterMenu, fetchChapterContent, clearOnlineCaches, sourceKey } from './utils/onlineBook'
+import { applyContentReplaceRules, applyTitleReplaceRules } from './utils/replaceRules'
 
 type HushreaderCommand = string | { type?: string; width?: number; height?: number; x?: number; y?: number; percent?: number }
 type HushreaderBounds = { x: number; y: number; width: number; height: number }
@@ -49,6 +53,13 @@ const enterAction = ref<any>({})
 const readerStore = useReaderStore()
 const bookStore = useBookStore()
 const configStore = useConfigStore()
+const onlineStore = useOnlineStore()
+const replaceStore = useReplaceStore()
+
+/** 净化规则匹配用的书源标识（书名 + 书源URL/名称） */
+function getBookOriginForReplace(book: any): string {
+  return book?.sourceName || sourceKey(book?.source) || book?.source?.bookSourceUrl || ''
+}
 
 const isReaderHidden = ref(false)
 const isAutoPaging = ref(false)
@@ -71,6 +82,11 @@ let offHushreaderCommand: (() => void) | undefined
 // 「撑高期间拖动/缩放过 → 按新配置还原」。
 let hushreaderMenuExpandedHeight: number | null = null
 let hushreaderMenuExpandSnapshot: { bounds: HushreaderBounds; width: number; height: number; x: number; y: number } | null = null
+
+// 在线阅读（在线书源 / 开源阅读）会话状态
+const readingOnlineBook = ref<any>(null)
+const onlineChapterLoadings = new Set<number>()
+const onlineChapterPromises = new Map<number, Promise<void>>()
 
 const cfg = computed(() => configStore.config)
 const hushreaderCfg = computed(() => cfg.value.hushreader)
@@ -220,8 +236,10 @@ function updateHushreaderLayout() {
 }
 
 function getHushreaderPayload(bounds = getHushreaderWindowBounds()) {
+  // 在线书目录为空时（onlineMode + 错误提示）也允许显示阅读窗，否则「已打开阅读器」却无窗口
+  const hasContent = readerStore.chapters.length > 0 || (readerStore.onlineMode && readerStore.onlineChapterError !== '')
   return {
-    visible: hushreaderActivated.value && Boolean(currentBook.value) && readerStore.chapters.length > 0 && !isReaderHidden.value,
+    visible: hushreaderActivated.value && Boolean(currentBook.value) && hasContent && !isReaderHidden.value,
     title: activeBookLabel.value,
     chapter: currentChapter.value?.title ?? '',
     progress: progressLabel.value,
@@ -267,7 +285,7 @@ function getHushreaderPayload(bounds = getHushreaderWindowBounds()) {
 // ztools.createBrowserWindow 返回的 Proxy<BrowserWindow> 每个方法都是一次跨进程 IPC，
 // 原来连调 setContentBounds / setContentSize / setSize / setPosition 四个方法（它们互相
 // 冗余，setBounds 本来就同时携带位置与尺寸），导致拖动/缩放时每帧多次 IPC 往返、严重不跟手。
-// 阅读窗每帧只发 1 条消息，主窗口只 setBounds 1 次。
+// 参考摸鱼阅读：阅读窗每帧只发 1 条消息，主窗口只 setBounds 1 次。
 // 窗口为无边框(frame:false)+无阴影，窗口 bounds 与内容 bounds 一致，单次 setBounds 即可。
 function applyHushreaderWindowBounds(bounds: HushreaderBounds, positionOnly = false) {
   if (!hushreaderWindow || hushreaderWindow.isDestroyed?.()) return
@@ -468,6 +486,9 @@ function closePlugin() {
   hushreaderMenuExpandedHeight = null
   hushreaderMenuExpandSnapshot = null
   stopReadingTimer()
+  readerStore.setOnlineMode(false)
+  readingOnlineBook.value = null
+  onlineChapterLoadings.clear(); onlineChapterPromises.clear()
   try { (window as any).ztools?.outPlugin?.() } catch { }
 }
 
@@ -524,6 +545,10 @@ function saveReadingProgress() {
 
   (window as any).__hushreaderSessionLastActive = now
   bookStore.updateBook(book.id, updates)
+  // 开源阅读同步的书回写阅读进度
+  if (book.format === 'online' && book.onlineKind === 'legado') {
+    onlineStore.pushProgress(bookStore.currentBook)
+  }
 }
 
 function getFileModifiedTime(filePath: string): number | null {
@@ -568,6 +593,15 @@ async function openBookAndHushreader(bookId: string) {
   const book = bookStore.currentBook
   if (!book) return
 
+  // 在线书籍：按需加载章节列表与正文
+  if (book.format === 'online') {
+    await openOnlineBook(book)
+    return
+  }
+  readingOnlineBook.value = null
+  readerStore.setOnlineMode(false)
+  onlineChapterLoadings.clear(); onlineChapterPromises.clear()
+
   const startChapter = book.lastChapter ?? 0
   const startIndex = book.progressIndex ?? 0
 
@@ -605,6 +639,111 @@ async function openBookAndHushreader(bookId: string) {
     toast(`打开失败：${e.message}`, 'error')
   } finally {
     readerStore.isLoading = false
+  }
+}
+
+/** Cookie Jar 上下文：在线阅读请求自动携带/保存书源域名 Cookie（对标 Legado enabledCookieJar） */
+function buildCookieCtx() {
+  return {
+    getCookie: (url: string) => onlineStore.jarCookie(url),
+    saveCookies: (url: string, cookies: string[]) => onlineStore.saveJarCookies(url, cookies)
+  }
+}
+
+/** 打开在线书籍：拉取章节列表 → 占位章节 → 加载当前章正文 */
+async function openOnlineBook(book: any) {
+  readerStore.isLoading = true
+  try {
+    const menu = await fetchChapterMenu(
+      { id: book.id, bookUrl: book.bookUrl, tocUrl: book.tocUrl, onlineKind: book.onlineKind, source: book.source },
+      { legado: onlineStore.legado, cookie: buildCookieCtx() }
+    )
+    // 净化规则：章节标题替换（对标 Legado ContentProcessor 标题规则）
+    const bookOrigin = getBookOriginForReplace(book)
+    const titled = menu.map((m, i) => ({
+      index: i,
+      title: applyTitleReplaceRules(m.title || `第${i + 1}章`, replaceStore.rules, book.title, bookOrigin),
+      content: ''
+    }))
+    readerStore.setChapters(titled)
+    readerStore.setOnlineMode(true)
+    readingOnlineBook.value = book
+    onlineChapterLoadings.clear(); onlineChapterPromises.clear()
+    bookStore.updateBook(book.id, { totalChapters: menu.length })
+
+    if (!menu.length) {
+      // 章节列表解析不到：仍打开阅读器，正文加载失败才阻止阅读
+      readerStore.onlineChapterError = '未能解析到章节列表，请检查书源规则（正文可能无法加载）'
+      toast('未能解析到章节列表，已打开阅读器', 'info')
+      updateHushreaderLayout()
+      hushreaderActivated.value = true
+      isReaderHidden.value = false
+      ensureHushreaderWindow()
+      startReadingTimer()
+      nextTick(() => pushHushreaderState())
+      return
+    }
+
+    const startChapter = Math.max(0, Math.min(book.lastChapter ?? 0, menu.length - 1))
+    readerStore.goToChapter(startChapter)
+    await ensureOnlineChapterContent(book, startChapter)
+    readerStore.goToProgress(startChapter, Math.min(book.progressIndex ?? 0, readerStore.chapters[startChapter]?.content?.length ?? 0))
+
+    updateHushreaderLayout()
+    hushreaderActivated.value = true
+    isReaderHidden.value = false
+    ensureHushreaderWindow()
+    startReadingTimer()
+    nextTick(() => pushHushreaderState())
+  } catch (e: any) {
+    toast(`打开失败：${e.message}`, 'error')
+    readerStore.setOnlineMode(false)
+    readingOnlineBook.value = null
+  } finally {
+    readerStore.isLoading = false
+  }
+}
+
+/** 加载在线书籍某章节正文（带去重与加载状态），成功后自动刷新阅读窗 */
+async function ensureOnlineChapterContent(book: any, index: number) {
+  const chapters = readerStore.chapters
+  if (index < 0 || index >= chapters.length) return
+  if (chapters[index]?.content) return
+  const pending = onlineChapterPromises.get(index)
+  if (pending) return pending
+  const promise = loadOnlineChapter(book, index).finally(() => {
+    onlineChapterPromises.delete(index)
+  })
+  onlineChapterPromises.set(index, promise)
+  return promise
+}
+
+async function loadOnlineChapter(book: any, index: number) {
+  onlineChapterLoadings.add(index)
+  readerStore.onlineChapterLoading = true
+  readerStore.onlineChapterError = ''
+  try {
+    const text = await fetchChapterContent(
+      { id: book.id, bookUrl: book.bookUrl, tocUrl: book.tocUrl, onlineKind: book.onlineKind, source: book.source },
+      index,
+      { legado: onlineStore.legado, cookie: buildCookieCtx() }
+    )
+    // 期间可能已切换其它书籍，避免写错章节
+    if (readingOnlineBook.value?.id !== book.id) return
+    const cur = readerStore.chapters[index]
+    if (cur) {
+      // 净化规则：正文替换（对标 Legado ContentProcessor 正文规则）
+      cur.content = applyContentReplaceRules(text, replaceStore.rules, book.title, getBookOriginForReplace(book))
+    }
+  } catch (e: any) {
+    if (readingOnlineBook.value?.id !== book.id) return
+    readerStore.onlineChapterError = e?.message || '章节加载失败'
+  } finally {
+    onlineChapterLoadings.delete(index)
+    readerStore.onlineChapterLoading = false
+    if (readingOnlineBook.value?.id === book.id) {
+      nextTick(() => pushHushreaderState())
+    }
   }
 }
 
@@ -733,7 +872,19 @@ function handleHushreaderCommand(command: HushreaderCommand) {
   else if (command === 'close') closePlugin()
   else if (command === 'auto') toggleAutoPaging()
   else if (command === 'close-reader') { isReaderHidden.value = true; blurHushreaderKeyboard() }
-  else if (command === 'destroy') { saveReadingProgress(); hushreaderActivated.value = false; hushreaderMenuExpandedHeight = null; hushreaderMenuExpandSnapshot = null; stopReadingTimer(); hushreaderWindow?.close?.(); hushreaderWindow = null }
+  else if (command === 'destroy') {
+    saveReadingProgress()
+    hushreaderActivated.value = false
+    stopReadingTimer()
+    readerStore.setOnlineMode(false)
+    readingOnlineBook.value = null
+    onlineChapterLoadings.clear(); onlineChapterPromises.clear()
+    clearOnlineCaches()
+    hushreaderMenuExpandedHeight = null
+    hushreaderMenuExpandSnapshot = null
+    hushreaderWindow?.close?.()
+    hushreaderWindow = null
+  }
   else if (command === 'show-main') { (window as any).ztools?.showMainWindow?.() }
   else if (command === 'stop-auto') { isAutoPaging.value = false; hushreaderCfg.value.autoFlipEnabled = false }
   else if (command === 'start-auto') { if (currentBook.value) { isAutoPaging.value = true; hushreaderCfg.value.autoFlipEnabled = true } }
@@ -818,6 +969,13 @@ watch(
       updateHushreaderLayout()
       saveReadingProgress()
     }
+    // 在线书籍：预加载当前章与相邻章正文
+    if (readingOnlineBook.value) {
+      const ci = readerStore.currentChapterIndex
+      ensureOnlineChapterContent(readingOnlineBook.value, ci)
+      ensureOnlineChapterContent(readingOnlineBook.value, ci + 1)
+      ensureOnlineChapterContent(readingOnlineBook.value, ci - 1)
+    }
   }
 )
 
@@ -876,6 +1034,8 @@ watch(
 onMounted(async () => {
   await configStore.load()
   await bookStore.load()
+  onlineStore.load()
+  replaceStore.load()
     ; (window as any).ztools?.onPluginEnter?.((action: any) => {
       if (action?.code === 'hushreader-close') {
         saveReadingProgress()
@@ -883,6 +1043,9 @@ onMounted(async () => {
         hushreaderMenuExpandedHeight = null
         hushreaderMenuExpandSnapshot = null
         stopReadingTimer()
+        readerStore.setOnlineMode(false)
+        readingOnlineBook.value = null
+        onlineChapterLoadings.clear(); onlineChapterPromises.clear()
         hushreaderWindow?.close?.()
         hushreaderWindow = null
         try { (window as any).ztools?.outPlugin?.() } catch { }
@@ -895,6 +1058,9 @@ onMounted(async () => {
       if (processExit) {
         saveReadingProgress()
         hushreaderActivated.value = false
+        readerStore.setOnlineMode(false)
+        readingOnlineBook.value = null
+        onlineChapterLoadings.clear(); onlineChapterPromises.clear()
         hushreaderMenuExpandedHeight = null
         hushreaderMenuExpandSnapshot = null
         hushreaderWindow?.close?.()

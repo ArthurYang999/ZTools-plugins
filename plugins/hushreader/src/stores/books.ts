@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { removeBookData, loadAllCovers, saveCover, saveCustomCover } from '../utils/db'
 import { optimizeCover, isCoverOversized } from '../utils/cover'
+import type { BookSource } from '../utils/onlineBook'
 
 export interface Bookmark {
   id: string
@@ -12,12 +13,14 @@ export interface Bookmark {
   createdAt: number
 }
 
+export type BookFormat = 'epub' | 'txt' | 'mobi' | 'online'
+
 export interface Book {
   id: string
   title: string
   author: string
   description?: string
-  format: 'epub' | 'txt' | 'mobi'
+  format: BookFormat
   filePath: string
   coverColor?: string
   coverImage?: string
@@ -38,6 +41,42 @@ export interface Book {
   fileModifiedAt?: number | null
   finishedAt?: number
   bookmarks?: Bookmark[]
+  // 在线书籍（在线书源 / 开源阅读同步）
+  onlineKind?: 'source' | 'legado'
+  source?: BookSource
+  bookUrl?: string
+  bookId?: string
+  sourceName?: string
+  /** 目录页地址（与详情页不同时有效，Legado 分离设计） */
+  tocUrl?: string
+  /** 最新章节标题 */
+  latestChapterTitle?: string
+  /** 字数文本 */
+  wordCount?: string
+  /** 分类（标签） */
+  kind?: string
+}
+
+export interface OnlineBookMeta {
+  title: string
+  author: string
+  description?: string
+  onlineKind: 'source' | 'legado'
+  bookUrl: string
+  bookId?: string
+  source?: BookSource
+  sourceName?: string
+  cover?: string
+  /** 书架分组（分类），如 Legado 同步的分组映射而来 */
+  categories?: string[]
+  progress?: number
+  chapterProgress?: number
+  chapterCount?: number
+  updateTime?: number
+  tocUrl?: string
+  latestChapterTitle?: string
+  wordCount?: string
+  kind?: string
 }
 
 function storageGet(key: string): string | null {
@@ -174,6 +213,42 @@ export const useBookStore = defineStore('books', () => {
     removeBookData(id).catch(() => { })
   }
 
+  /** 添加在线书籍（在线书源 / 开源阅读同步），按 bookUrl 去重 */
+  function addOnlineBook(meta: OnlineBookMeta) {
+    if (meta.bookUrl && books.value.some(b => {
+      return b.format === 'online' && b.onlineKind === meta.onlineKind && b.bookUrl === meta.bookUrl
+    })) return undefined
+    const now = Date.now()
+    const newBook: Book = {
+      id: `book_${now}_${Math.random().toString(36).slice(2)}`,
+      title: meta.title || '未命名',
+      author: meta.author || '',
+      description: meta.description,
+      format: 'online',
+      filePath: '',
+      onlineKind: meta.onlineKind,
+      source: meta.source,
+      bookUrl: meta.bookUrl,
+      bookId: meta.bookId,
+      sourceName: meta.sourceName || (meta.onlineKind === 'legado' ? '开源阅读' : ''),
+      coverImage: meta.cover,
+      categories: meta.categories,
+      tocUrl: meta.tocUrl,
+      latestChapterTitle: meta.latestChapterTitle,
+      wordCount: meta.wordCount,
+      kind: meta.kind,
+      lastChapter: meta.progress ?? 0,
+      progressIndex: meta.chapterProgress ?? 0,
+      totalChapters: meta.chapterCount,
+      addedAt: now,
+      updatedAt: now
+    }
+    books.value.unshift(newBook)
+    save()
+    if (meta.cover) saveCover(newBook.id, meta.cover).catch(() => { })
+    return newBook
+  }
+
   function updateBook(id: string, updates: Partial<Book>) {
     const idx = books.value.findIndex(b => b.id === id)
     if (idx !== -1) {
@@ -231,6 +306,6 @@ export const useBookStore = defineStore('books', () => {
   return {
     books, currentBookId, currentBook,
     sortBy, searchQuery, activeCategory, filteredBooks, categories,
-    load, addBook, removeBook, updateBook, setCurrentBook, save
+    load, addBook, addOnlineBook, removeBook, updateBook, setCurrentBook, save
   }
 })

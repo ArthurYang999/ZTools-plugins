@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, nextTick, watch } from 'vue'
 
-const props = defineProps<{ pos: { x: number; y: number }; isFinished?: boolean }>()
+const props = defineProps<{ pos: { x: number; y: number }; isFinished?: boolean; isOnline?: boolean }>()
 const emit = defineEmits<{
   'book-info': []
   'chapter-list': []
@@ -58,15 +58,15 @@ watch(
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
         书签列表
       </li>
-      <li class="ctx-item" @click="emit('search-jump')">
+      <li v-if="!isOnline" class="ctx-item" @click="emit('search-jump')">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
         搜索跳转
       </li>
-      <li class="ctx-item" @click="emit('change-path')">
+      <li v-if="!isOnline" class="ctx-item" @click="emit('change-path')">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         修改本地路径
       </li>
-      <li class="ctx-item" @click="emit('open-file-location')">
+      <li v-if="!isOnline" class="ctx-item" @click="emit('open-file-location')">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
         打开文件位置
       </li>

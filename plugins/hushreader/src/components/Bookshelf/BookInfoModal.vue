@@ -25,6 +25,11 @@ const editNewCategory = ref('')
 
 const imgError = ref(false)
 
+const formatLabel = computed(() => {
+  if (props.book.format === 'online') return props.book.sourceName || '在线'
+  return props.book.format.toUpperCase()
+})
+
 const displayCover = computed(() => {
   if (imgError.value) return undefined
   return props.book.customCoverImage || props.book.coverImage
@@ -145,7 +150,7 @@ watch(() => props.book, () => {
               <img v-if="displayCover" :src="displayCover" :alt="book.title" class="cover-img" draggable="false"
                 @error="imgError = true" />
               <template v-else>
-                <span class="cover-format">{{ book.format.toUpperCase() }}</span>
+                <span class="cover-format">{{ formatLabel }}</span>
                 <span class="cover-title-text">{{ book.title }}</span>
               </template>
             </div>
@@ -153,7 +158,7 @@ watch(() => props.book, () => {
               <img v-if="displayCover" :src="displayCover" :alt="book.title" class="cover-img" draggable="false"
                 @error="imgError = true" />
               <template v-else>
-                <span class="cover-format">{{ book.format.toUpperCase() }}</span>
+                <span class="cover-format">{{ formatLabel }}</span>
                 <span class="cover-title-text">{{ book.title }}</span>
               </template>
               <div class="cover-upload-hint">点击更换</div>
@@ -163,7 +168,7 @@ watch(() => props.book, () => {
             <template v-if="!isEditing">
               <h2 class="book-main-title">{{ book.title }}</h2>
               <p class="book-main-author">{{ book.author || '未知作者' }}</p>
-              <span class="book-format-badge">{{ book.format.toUpperCase() }}</span>
+              <span class="book-format-badge">{{ formatLabel }}</span>
             </template>
             <template v-else>
               <label class="edit-label">标题</label>
@@ -216,7 +221,30 @@ watch(() => props.book, () => {
           </template>
         </div>
 
-        <!-- Card 4: Reading Info -->
+        <!-- Card 4: 在线书源信息 -->
+        <div v-if="book.format === 'online'" class="info-card">
+          <div class="card-label">书源信息</div>
+          <div class="reading-grid">
+            <div class="reading-item">
+              <span class="reading-key">来源</span>
+              <span class="reading-val">{{ book.sourceName || book.source?.bookSourceName || '在线书源' }}</span>
+            </div>
+            <div class="reading-item" v-if="book.latestChapterTitle">
+              <span class="reading-key">最新章节</span>
+              <span class="reading-val" style="white-space: normal; word-break: break-all;">{{ book.latestChapterTitle }}</span>
+            </div>
+            <div class="reading-item" v-if="book.wordCount">
+              <span class="reading-key">字数</span>
+              <span class="reading-val">{{ book.wordCount }}</span>
+            </div>
+            <div class="reading-item" v-if="book.kind">
+              <span class="reading-key">分类</span>
+              <span class="reading-val">{{ book.kind }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 5: Reading Info -->
         <div class="info-card">
           <div class="card-label">阅读信息</div>
           <div class="reading-grid">
