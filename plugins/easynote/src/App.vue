@@ -2,7 +2,8 @@
 import { onMounted, onUnmounted, ref } from 'vue'
 import Home from './Note/Home.vue'
 import StickyNote from './Note/StickyNote.vue'
-import { openStickyWindow, isStandaloneSupported, isStickyNoteOpen } from './Note/host'
+import EdgeTab from './Note/EdgeTab.vue'
+import { openStickyWindow, isStandaloneSupported, isStickyNoteOpen, initHostBridge } from './Note/host'
 import { useNotes } from './Note/composables/useNotes'
 
 const winType = ref<'main' | 'detach' | 'browser'>(window.ztools.getWindowType())
@@ -10,14 +11,25 @@ const view = ref<'home' | 'editor'>('home')
 
 const { reloadNotes, loadDraft } = useNotes()
 
+let unloadTimer: ReturnType<typeof setInterval> | null = null
+
+const params = new URLSearchParams(location.search)
+/** 最小化后的边缘标签窗口（?view=tab） */
+const isEdgeTab = winType.value === 'browser' && params.get('view') === 'tab'
+
 // 独立便利贴窗口：同步加载草稿，确保 MilkdownEditor 初始值正确
-if (winType.value === 'browser') {
-  const noteId = new URLSearchParams(location.search).get('note')
-  loadDraft(noteId)
+if (winType.value === 'browser' && !isEdgeTab) {
+  loadDraft(params.get('note'))
 }
+
+// 标签窗口铺满整个窗口，不能带外层背景色，否则窗口边缘会露出底色
+if (isEdgeTab) document.body.classList.add('win-edge-tab')
 
 onMounted(() => {
   if (winType.value === 'browser') return
+
+  // 窗口管家：接便利贴 / 标签窗口发来的指令（最小化、还原、关闭）
+  initHostBridge()
 
   reloadNotes()
   window.ztools.setExpendHeight?.(560)
@@ -30,7 +42,7 @@ onMounted(() => {
       return
     }
     if (action.code === 'new-note') {
-      openEditor(null)
+      openSticky(null)
       return
     }
   })
@@ -41,6 +53,10 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('beforeunload', onBeforeUnload)
+  if (unloadTimer) {
+    clearInterval(unloadTimer)
+    unloadTimer = null
+  }
 })
 
 function onBeforeUnload(e: BeforeUnloadEvent) {
@@ -55,16 +71,20 @@ function onBeforeUnload(e: BeforeUnloadEvent) {
     }
 
     // 轮询检测便利贴窗口是否已关闭，关闭后结束插件进程
-    const timer = setInterval(() => {
+    if (unloadTimer) clearInterval(unloadTimer)
+    unloadTimer = setInterval(() => {
       if (!isStickyNoteOpen()) {
-        clearInterval(timer)
+        if (unloadTimer) {
+          clearInterval(unloadTimer)
+          unloadTimer = null
+        }
         window.ztools.outPlugin(true)
       }
     }, 500)
   }
 }
 
-function openEditor(noteId: string | null) {
+function openSticky(noteId: string | null) {
   loadDraft(noteId)
   if (isStandaloneSupported()) {
     // 独立窗口模式：创建便利贴窗口，如果失败则回退到嵌入模式
@@ -85,6 +105,12 @@ function openEditor(noteId: string | null) {
   }
 }
 
+/** 在列表直接打开：进入普通内容页面（主窗口内嵌，可查看、可编辑） */
+function openContent(noteId: string) {
+  loadDraft(noteId)
+  view.value = 'editor'
+}
+
 function onBack() {
   reloadNotes()
   view.value = 'home'
@@ -96,12 +122,18 @@ function onSaved() {
 </script>
 
 <template>
-  <StickyNote v-if="winType === 'browser'" />
+  <EdgeTab v-if="isEdgeTab" />
+  <StickyNote v-else-if="winType === 'browser'" />
   <StickyNote
     v-else-if="view === 'editor'"
     embedded
     @back="onBack"
     @saved="onSaved"
   />
-  <Home v-else @new="openEditor(null)" @open="openEditor($event)" />
+  <Home
+    v-else
+    @new="openSticky(null)"
+    @open="openContent($event)"
+    @open-sticky="openSticky($event)"
+  />
 </template>

@@ -23,6 +23,20 @@ const clickEvent = (overrides = {}) => ({
   ...overrides
 })
 
+const withSelection = (selection, callback) => {
+  const previousGetSelection = globalThis.getSelection
+  globalThis.getSelection = () => selection
+  try {
+    callback()
+  } finally {
+    if (previousGetSelection) {
+      globalThis.getSelection = previousGetSelection
+    } else {
+      delete globalThis.getSelection
+    }
+  }
+}
+
 test('keeps selected items in click order', async () => {
   const first = { type: 'text', content: 'first' }
   const second = { type: 'text', content: 'second' }
@@ -58,6 +72,87 @@ test('copies the current selection with Ctrl+C', () => {
     selectedItems: [first, second],
     shouldPaste: false
   })
+})
+
+test('leaves Ctrl+C to the browser when text is selected', () => {
+  const first = { type: 'text', content: 'first' }
+  const second = { type: 'text', content: 'second' }
+  const { selection, writes } = createSelection([first, second])
+  let prevented = false
+
+  selection.toggleItem(1)
+  withSelection({ rangeCount: 1, isCollapsed: false }, () => {
+    selection.handleKeydown({
+      key: 'c',
+      ctrlKey: true,
+      metaKey: false,
+      preventDefault: () => { prevented = true }
+    })
+  })
+
+  assert.equal(prevented, false)
+  assert.deepEqual(writes, [])
+})
+
+test('leaves Ctrl+C to a focused text input', () => {
+  const item = { type: 'text', content: 'first' }
+  const { selection, writes } = createSelection([item])
+  let prevented = false
+
+  selection.handleKeydown({
+    key: 'c',
+    ctrlKey: true,
+    metaKey: false,
+    target: { tagName: 'INPUT', type: 'text' },
+    preventDefault: () => { prevented = true }
+  })
+
+  assert.equal(prevented, false)
+  assert.deepEqual(writes, [])
+})
+
+test('keeps record selection unchanged after dragging to select text', () => {
+  const first = { type: 'text', content: 'first' }
+  const second = { type: 'text', content: 'second' }
+  const { selection } = createSelection([first, second])
+
+  selection.toggleItem(1)
+  let handled
+  withSelection({ rangeCount: 1, isCollapsed: false }, () => {
+    handled = selection.handleItemClick(clickEvent(), 0)
+  })
+
+  assert.equal(handled, false)
+  assert.deepEqual(selection.selectedItems.value, [first, second])
+})
+
+test('reports a regular item click as handled', () => {
+  const first = { type: 'text', content: 'first' }
+  const second = { type: 'text', content: 'second' }
+  const { selection } = createSelection([first, second])
+
+  const handled = selection.handleItemClick(clickEvent(), 1)
+
+  assert.equal(handled, true)
+  assert.deepEqual(selection.selectedItems.value, [second])
+})
+
+test('lets an explicit Ctrl+click replace a stale browser text selection', () => {
+  const first = { type: 'text', content: 'first' }
+  const second = { type: 'text', content: 'second' }
+  const { selection } = createSelection([first, second])
+  let cleared = false
+
+  withSelection({
+    rangeCount: 1,
+    isCollapsed: false,
+    removeAllRanges: () => { cleared = true }
+  }, () => {
+    selection.handleItemClick(clickEvent({ ctrlKey: true }), 1)
+  })
+
+  assert.equal(cleared, true)
+  assert.deepEqual(selection.selectedItems.value, [first, second])
 })
 
 test('switches to a single selection when the type changes', () => {
@@ -104,6 +199,36 @@ test('selects matching items in a shift range', () => {
   selection.handleItemClick(clickEvent({ shiftKey: true }), 2)
 
   assert.deepEqual(selection.selectedItems.value, [first, third])
+})
+
+test('lets an explicit Shift+click replace a browser text selection', () => {
+  const first = { type: 'text', content: 'first' }
+  const second = { type: 'text', content: 'second' }
+  const third = { type: 'text', content: 'third' }
+  const { selection } = createSelection([first, second, third])
+  let cleared = false
+
+  withSelection({
+    rangeCount: 1,
+    isCollapsed: false,
+    removeAllRanges: () => { cleared = true }
+  }, () => {
+    selection.handleItemClick(clickEvent({ shiftKey: true }), 2)
+  })
+
+  assert.equal(cleared, true)
+  assert.deepEqual(selection.selectedItems.value, [first, second, third])
+})
+
+test('selects a range when Shift+clicking a checkbox', () => {
+  const first = { type: 'text', content: 'first' }
+  const second = { type: 'text', content: 'second' }
+  const third = { type: 'text', content: 'third' }
+  const { selection } = createSelection([first, second, third])
+
+  selection.handleToggleClick(clickEvent({ shiftKey: true }), 2)
+
+  assert.deepEqual(selection.selectedItems.value, [first, second, third])
 })
 
 test('orders a reverse shift range from the anchor to the clicked item', () => {
