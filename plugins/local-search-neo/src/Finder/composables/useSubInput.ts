@@ -3,32 +3,25 @@ import { useFinderQuery } from "./useFinderQuery";
 
 interface UseSubInputOptions {
   onInput?: () => void;
-  placeholder?: string;
 }
 
 const inputListeners = new Set<() => void>();
 let subInputReady = false;
 let programmaticInputValue: string | undefined;
-let activePlaceholder = "全盘搜索";
 
-export function useSubInput({ onInput, placeholder = "全盘搜索" }: UseSubInputOptions = {}) {
+export function useSubInput({ onInput }: UseSubInputOptions = {}) {
   const { queryText, setQueryText } = useFinderQuery();
 
   if (onInput) {
     inputListeners.add(onInput);
+    onUnmounted(() => {
+      if (onInput) {
+        inputListeners.delete(onInput);
+      }
+    });
   }
 
-  onUnmounted(() => {
-    if (onInput) {
-      inputListeners.delete(onInput);
-    }
-    disposeSubInput();
-  });
-
-  function bindSubInput() {
-    activePlaceholder = placeholder;
-    if (subInputReady) return;
-
+  function bindSubInput(placeholder: string = "全盘搜索") {
     window.ztools.setSubInput(
       ({ text }) => {
         if (programmaticInputValue === text) {
@@ -40,12 +33,13 @@ export function useSubInput({ onInput, placeholder = "全盘搜索" }: UseSubInp
         setQueryText(text);
         notifyInputListeners();
       },
-      activePlaceholder,
+      placeholder,
       true,
     );
     subInputReady = true;
   }
 
+  /** 当非用户操作需要修改子输入框的值, 不触发重新搜索 */
   function syncSubInputValue() {
     if (!subInputReady) return;
     programmaticInputValue = queryText.value;
@@ -56,19 +50,10 @@ export function useSubInput({ onInput, placeholder = "全盘搜索" }: UseSubInp
     window.ztools.subInputFocus();
   }
 
-  function disposeSubInput() {
-    if (!subInputReady) return;
-
-    window.ztools.removeSubInput();
-    subInputReady = false;
-    programmaticInputValue = undefined;
-  }
-
   return {
     bindSubInput,
     syncSubInputValue,
     focusSubInput,
-    disposeSubInput,
   };
 }
 
