@@ -2,11 +2,52 @@
   const enc = new TextEncoder(), dec = new TextDecoder();
   const pairScreen = document.querySelector("#pairScreen"), chatApp = document.querySelector("#chatApp");
   const messagesEl = document.querySelector("#messages"), pairError = document.querySelector("#pairError");
+  const pairCode = document.querySelector("#pairCode"), pairButton = document.querySelector("#pairButton"), manualPairForm = document.querySelector("#manualPairForm");
+  const autoPairPanel = document.querySelector("#autoPairPanel"), autoPairCode = document.querySelector("#autoPairCode"), autoPairTitle = document.querySelector("#autoPairTitle"), autoPairStatus = document.querySelector("#autoPairStatus"), autoPairError = document.querySelector("#autoPairError"), retryChatButton = document.querySelector("#retryChatButton"), manualPairButton = document.querySelector("#manualPairButton");
+  const autoPairBadge = autoPairPanel.querySelector(".auto-pair__badge"), autoPairSteps = [...document.querySelectorAll(".auto-step")];
   const progress = document.querySelector("#progress"), progressBar = progress.querySelector("i");
-  const deviceId = localStorage.deviceLinkDeviceId || (localStorage.deviceLinkDeviceId = randomDeviceId());
+  const SESSION_KEY = "deviceLinkSession", TRUSTED_DEVICE_KEY = "deviceLinkTrustedDevice";
+  const persistentStorage = browserStorage("localStorage"), transientStorage = browserStorage("sessionStorage");
+  const storedDeviceId = storageGet(persistentStorage, "deviceLinkDeviceId"), deviceId = storedDeviceId || randomDeviceId();
+  if (!storedDeviceId) storageSet(persistentStorage, "deviceLinkDeviceId", deviceId);
   const defaultName = /iPhone|iPad|iPod/i.test(navigator.userAgent) ? "iPhone / iPad" : /Android/i.test(navigator.userAgent) ? "Android 手机" : "浏览器设备";
-  document.querySelector("#deviceName").value = localStorage.deviceLinkDeviceName || defaultName;
-  let pairing, token, key, socket, ownDeviceId = deviceId, currentConversationId = `device:${deviceId}`, messageMap = /* @__PURE__ */ new Map();
+  document.querySelector("#deviceName").value = storageGet(persistentStorage, "deviceLinkDeviceName") || defaultName;
+  const reduceMotion = Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+  const AUTO_PAIR_TIMING = Object.freeze({
+    recognitionHold: 420,
+    digitInterval: 100,
+    verificationMinimum: 650,
+    successHold: 900
+  });
+  let pairing, token, key, socket, reconnectTimer, scannedPairingContext, manualFallbackMessage = "", recoveryTrustedSaved = true, autoPairingAttempted = false, ownDeviceId = deviceId, currentConversationId = `device:${deviceId}`, messageMap = /* @__PURE__ */ new Map();
+  function browserStorage(name) {
+    try {
+      return window[name];
+    } catch {
+      return null;
+    }
+  }
+  function storageGet(storage, name) {
+    try {
+      return storage?.getItem(name) || "";
+    } catch {
+      return "";
+    }
+  }
+  function storageSet(storage, name, value) {
+    try {
+      storage?.setItem(name, value);
+      return Boolean(storage);
+    } catch {
+      return false;
+    }
+  }
+  function storageRemove(storage, name) {
+    try {
+      storage?.removeItem(name);
+    } catch {
+    }
+  }
   function randomDeviceId() {
     const bytes = crypto.getRandomValues(new Uint8Array(16));
     bytes[6] = bytes[6] & 15 | 64;
@@ -41,6 +82,14 @@
     const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: b64ToBytes(state.salt), iterations: state.iterations }, material, 256);
     const hkey = await crypto.subtle.importKey("raw", bits, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
     return bytesToB64(await crypto.subtle.sign("HMAC", hkey, enc.encode(`device-link-pair-v1:${state.sessionId}:${state.challenge}`)));
+  }
+  async function trustedDeviceProof(secret, state) {
+    const secretBytes = b64ToBytes(secret);
+    if (secretBytes.length !== 32) throw new Error("已保存的设备凭据无效");
+    const message = enc.encode(`device-link-resume-v1:${state.challengeId}:${state.challenge}`);
+    if (!hasWebCrypto()) return bytesToB64(deviceLinkCryptoFallback.hmacSha256(secretBytes, message));
+    const hkey = await crypto.subtle.importKey("raw", secretBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return bytesToB64(await crypto.subtle.sign("HMAC", hkey, message));
   }
   async function importSessionKey(value) {
     const bytes = b64ToBytes(value);
@@ -115,12 +164,62 @@
     if (size < 1073741824) return `${(size / 1048576).toFixed(1)} MB`;
     return `${(size / 1073741824).toFixed(1)} GB`;
   }
-  function getPairingContextFromUrl() {
+  function readPairingContextFromUrl() {
     const scannedUrl = new URL(location.href);
+    const fragment = new URLSearchParams(scannedUrl.hash.slice(1));
     return {
-      secret: new URLSearchParams(scannedUrl.hash.slice(1)).get("pair"),
-      requestedSessionId: scannedUrl.searchParams.get("pairing")
+      secret: fragment.get("pair"),
+      autoCode: fragment.get("code") || "",
+      automatic: fragment.get("auto") === "1",
+      requestedSessionId: scannedUrl.searchParams.get("pairing"),
+      hasQrCredential: fragment.has("pair") || fragment.has("code") || fragment.has("auto")
     };
+  }
+  function capturePairingContextFromUrl() {
+    const context = readPairingContextFromUrl();
+    if (!context.hasQrCredential) return context;
+    scannedPairingContext = context;
+    history.replaceState(null, "", location.pathname);
+    return context;
+  }
+  function getPairingContext() {
+    return scannedPairingContext || readPairingContextFromUrl();
+  }
+  function readStoredJson(storage, name) {
+    try {
+      return JSON.parse(storageGet(storage, name) || "null");
+    } catch {
+      storageRemove(storage, name);
+      return null;
+    }
+  }
+  function saveSession(pkg) {
+    token = pkg.token;
+    ownDeviceId = pkg.deviceId;
+    currentConversationId = `device:${ownDeviceId}`;
+    storageSet(transientStorage, SESSION_KEY, JSON.stringify({ token: pkg.token, sessionKey: pkg.sessionKey, deviceId: pkg.deviceId, serverDeviceId: pkg.serverDeviceId, expiresAt: pkg.expiresAt }));
+  }
+  function clearSession() {
+    storageRemove(transientStorage, SESSION_KEY);
+    token = void 0;
+    key = void 0;
+  }
+  function showPairing(message = "") {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = void 0;
+    socket = void 0;
+    chatApp.style.display = "none";
+    pairScreen.style.display = "grid";
+    showManualPairing(message);
+  }
+  function showManualPairing(message = "") {
+    autoPairPanel.hidden = true;
+    autoPairPanel.classList.remove("is-complete", "is-failed", "is-recovering");
+    manualPairForm.hidden = false;
+    retryChatButton.hidden = true;
+    manualPairButton.hidden = true;
+    autoPairError.textContent = "";
+    pairError.textContent = message;
   }
   function messageTime(value) {
     return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(value));
@@ -212,7 +311,11 @@
   async function fetchJson(url, options = {}) {
     const response = await fetch(url, options);
     const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error || `请求失败（${response.status}）`);
+    if (!response.ok) {
+      const error = new Error(body.error || `请求失败（${response.status}）`);
+      error.status = response.status;
+      throw error;
+    }
     return body;
   }
   async function fetchWithRetry(url, options = {}) {
@@ -304,61 +407,228 @@
       pairError.textContent = error.message;
     }
   }
-  async function pair() {
-    pairError.textContent = "";
-    const button = document.querySelector("#pairButton");
-    button.disabled = true;
-    try {
-      const { secret, requestedSessionId } = getPairingContextFromUrl();
-      if (!requestedSessionId) throw new Error("二维码缺少配对会话标识，请重新扫描最新二维码");
-      if (!secret) throw new Error("二维码缺少一次性连接密钥，请重新扫描");
-      const latestPairing = await loadPairing();
-      if (requestedSessionId !== latestPairing.sessionId) throw new Error("配对信息已过期，请在电脑端刷新二维码");
-      const code = document.querySelector("#pairCode").value.trim();
-      if (!/^\d{6,12}$/.test(code)) throw new Error("请输入 6–12 位数字匹配码");
-      const name = document.querySelector("#deviceName").value.trim() || defaultName;
-      const proof = await hmacProof(secret, code, latestPairing);
-      const pairKey = await deriveKey(secret, code, latestPairing.salt, latestPairing.iterations);
-      const result = await fetchJson("/api/pair", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: latestPairing.sessionId, proof, deviceName: name, deviceId, platform: navigator.platform || "browser" }) });
-      const pkg = await decryptJson(result.package, `pair:${latestPairing.sessionId}`, pairKey);
-      token = pkg.token;
-      key = await importSessionKey(pkg.sessionKey);
-      ownDeviceId = pkg.deviceId;
-      currentConversationId = `device:${ownDeviceId}`;
-      localStorage.deviceLinkDeviceName = name;
-      sessionStorage.deviceLinkSession = JSON.stringify({ token, sessionKey: pkg.sessionKey, deviceId: pkg.deviceId, expiresAt: pkg.expiresAt });
-      openChat();
-    } catch (error) {
-      pairError.textContent = error.message;
-    } finally {
-      button.disabled = false;
+  function pause(ms) {
+    return reduceMotion || ms <= 0 ? Promise.resolve() : new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  function setAutoPairStep(index, status) {
+    autoPairStatus.textContent = status;
+    autoPairSteps.forEach((step, stepIndex) => {
+      step.classList.toggle("is-complete", stepIndex < index);
+      step.classList.toggle("is-active", stepIndex === index);
+      if (stepIndex === index) step.setAttribute("aria-current", "step");
+      else step.removeAttribute("aria-current");
+    });
+  }
+  function prepareAutoPairing(code) {
+    const length = /^\d{6,12}$/.test(code) ? code.length : 6;
+    manualPairForm.hidden = true;
+    autoPairPanel.hidden = false;
+    autoPairPanel.classList.remove("is-complete", "is-failed", "is-recovering");
+    autoPairBadge.textContent = "↗";
+    autoPairTitle.textContent = "已识别二维码";
+    autoPairError.textContent = "";
+    retryChatButton.hidden = true;
+    manualPairButton.hidden = true;
+    autoPairCode.style.setProperty("--code-columns", String(Math.min(length, 6)));
+    autoPairCode.setAttribute("aria-label", `正在读取 ${length} 位一次性扫码授权码`);
+    autoPairCode.replaceChildren(...Array.from({ length }, () => {
+      const digit = document.createElement("span");
+      digit.className = "auto-code__digit";
+      digit.setAttribute("aria-hidden", "true");
+      return digit;
+    }));
+    setAutoPairStep(0, "正在确认要连接的电脑");
+  }
+  async function animateAutoPairCode(code) {
+    pairCode.value = "";
+    const digits = [...autoPairCode.children];
+    for (let index = 0; index < code.length; index++) {
+      pairCode.value += code[index];
+      digits[index].textContent = code[index];
+      digits[index].classList.add("is-filled");
+      await pause(AUTO_PAIR_TIMING.digitInterval);
     }
   }
-  async function restore() {
+  async function establishPairing(code) {
+    const { secret, requestedSessionId } = getPairingContext();
+    const latestPairing = await loadPairing();
+    const hasQrContext = Boolean(secret || requestedSessionId);
+    let pairingSecret = latestPairing.manualKey, mode = "manual";
+    if (hasQrContext) {
+      if (!requestedSessionId) throw new Error("二维码缺少配对会话标识，请重新扫描最新二维码");
+      if (!secret) throw new Error("二维码缺少一次性连接密钥，请重新扫描");
+      if (requestedSessionId !== latestPairing.sessionId) throw new Error("配对信息已过期，请在电脑端刷新二维码");
+      pairingSecret = secret;
+      mode = "qr";
+    } else if (!pairingSecret) throw new Error("电脑端暂不支持手动连接，请刷新配对信息");
+    const matchingCode = String(code || "").trim();
+    if (!/^\d{6,12}$/.test(matchingCode)) throw new Error("请输入 6–12 位数字匹配码");
+    const name = document.querySelector("#deviceName").value.trim() || defaultName;
+    const proof = await hmacProof(pairingSecret, matchingCode, latestPairing);
+    const pairKey = await deriveKey(pairingSecret, matchingCode, latestPairing.salt, latestPairing.iterations);
+    const result = await fetchJson("/api/pair", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: latestPairing.sessionId, mode, proof, deviceName: name, deviceId, platform: navigator.platform || "browser" }) });
+    const pkg = await decryptJson(result.package, `pair:${latestPairing.sessionId}`, pairKey);
+    saveSession(pkg);
+    key = await importSessionKey(pkg.sessionKey);
+    storageSet(persistentStorage, "deviceLinkDeviceName", name);
+    const trustedSaved = !pkg.resumeSecret || storageSet(persistentStorage, TRUSTED_DEVICE_KEY, JSON.stringify({ deviceId: pkg.deviceId, resumeSecret: pkg.resumeSecret, serverDeviceId: pkg.serverDeviceId }));
+    if (mode === "qr") scannedPairingContext = void 0;
+    pairCode.value = "";
+    return { trustedSaved };
+  }
+  async function openSavedChat(trustedSaved) {
     try {
-      const saved = JSON.parse(sessionStorage.deviceLinkSession || "null");
-      if (!saved || new Date(saved.expiresAt) <= /* @__PURE__ */ new Date()) return false;
-      token = saved.token;
-      key = await importSessionKey(saved.sessionKey);
-      ownDeviceId = saved.deviceId;
-      currentConversationId = `device:${ownDeviceId}`;
+      await openChat();
+    } catch (error) {
+      if (error.status !== 401) throw error;
+      clearSession();
+      if (!await resumeTrustedDevice()) throw error;
+      await openChat();
+    }
+    if (!trustedSaved) showToast("浏览器禁止保存设备授权，下次访问需要重新配对");
+  }
+  function showPairedRecovery(error, trustedSaved = true) {
+    recoveryTrustedSaved = trustedSaved;
+    manualPairForm.hidden = true;
+    autoPairPanel.hidden = false;
+    autoPairPanel.classList.remove("is-failed");
+    autoPairPanel.classList.add("is-complete", "is-recovering");
+    autoPairBadge.textContent = "↻";
+    autoPairTitle.textContent = "设备已授权";
+    autoPairStatus.textContent = "进入会话时网络暂时不可用";
+    autoPairError.textContent = `连接信息已安全保留：${error.message}`;
+    manualFallbackMessage = error.message;
+    manualPairButton.hidden = error.status !== 401;
+    retryChatButton.hidden = false;
+  }
+  async function pair() {
+    pairError.textContent = "";
+    pairButton.disabled = true;
+    pairButton.textContent = "正在建立连接…";
+    let paired;
+    try {
+      paired = await establishPairing(pairCode.value);
+      await openSavedChat(paired.trustedSaved);
+    } catch (error) {
+      if (paired) showPairedRecovery(error, paired.trustedSaved);
+      else pairError.textContent = error.message;
+    } finally {
+      pairButton.disabled = false;
+      pairButton.textContent = "安全连接";
+    }
+  }
+  async function autoConnectFromQr() {
+    const context = getPairingContext();
+    if (autoPairingAttempted || !context.automatic) return false;
+    autoPairingAttempted = true;
+    if (autoPairPanel.hidden) prepareAutoPairing(context.autoCode);
+    let paired;
+    try {
+      if (!context.secret || !context.requestedSessionId || !/^\d{6,12}$/.test(context.autoCode)) {
+        throw new Error("二维码缺少自动连接信息，请重新扫描电脑端最新二维码");
+      }
+      await pause(AUTO_PAIR_TIMING.recognitionHold);
+      setAutoPairStep(1, "正在读取一次性扫码授权码");
+      await animateAutoPairCode(context.autoCode);
+      setAutoPairStep(2, "正在校验并建立加密连接");
+      [paired] = await Promise.all([
+        establishPairing(context.autoCode),
+        pause(AUTO_PAIR_TIMING.verificationMinimum)
+      ]);
+      autoPairPanel.classList.add("is-complete");
+      autoPairBadge.textContent = "✓";
+      autoPairTitle.textContent = "连接完成";
+      setAutoPairStep(3, "安全连接已建立，正在进入会话");
+      await pause(AUTO_PAIR_TIMING.successHold);
+      await openSavedChat(paired.trustedSaved);
       return true;
-    } catch {
+    } catch (error) {
+      if (paired) {
+        showPairedRecovery(error, paired.trustedSaved);
+        return false;
+      }
+      manualFallbackMessage = error.message;
+      autoPairPanel.classList.add("is-failed");
+      autoPairBadge.textContent = "!";
+      autoPairTitle.textContent = "自动连接未完成";
+      autoPairStatus.textContent = "请重新扫码，或改为手动输入";
+      autoPairError.textContent = error.message;
+      manualPairButton.hidden = false;
       return false;
     }
   }
+  async function restoreSession() {
+    try {
+      const saved = readStoredJson(transientStorage, SESSION_KEY);
+      if (!saved || new Date(saved.expiresAt) <= /* @__PURE__ */ new Date()) return false;
+      if (saved.serverDeviceId && pairing.serverDeviceId && saved.serverDeviceId !== pairing.serverDeviceId) return false;
+      saveSession(saved);
+      key = await importSessionKey(saved.sessionKey);
+      return true;
+    } catch {
+      clearSession();
+      return false;
+    }
+  }
+  async function resumeTrustedDevice() {
+    const trusted = readStoredJson(persistentStorage, TRUSTED_DEVICE_KEY);
+    if (!trusted?.deviceId || !trusted?.resumeSecret) return false;
+    if (trusted.serverDeviceId && pairing.serverDeviceId && trusted.serverDeviceId !== pairing.serverDeviceId) {
+      storageRemove(persistentStorage, TRUSTED_DEVICE_KEY);
+      return false;
+    }
+    try {
+      const challenge = await fetchJson("/api/resume/challenge", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: trusted.deviceId }) });
+      if (trusted.serverDeviceId && challenge.serverDeviceId !== trusted.serverDeviceId) throw new Error("连接的电脑已发生变化，请重新配对");
+      const resumeKey = await importSessionKey(trusted.resumeSecret);
+      const proof = await trustedDeviceProof(trusted.resumeSecret, challenge);
+      const result = await fetchJson("/api/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: trusted.deviceId, challengeId: challenge.challengeId, proof }) });
+      const pkg = await decryptJson(result.package, `resume:${trusted.deviceId}:${challenge.challengeId}`, resumeKey);
+      saveSession(pkg);
+      key = await importSessionKey(pkg.sessionKey);
+      return true;
+    } catch (error) {
+      clearSession();
+      if (error.status === 401 || error.status === 404) {
+        storageRemove(persistentStorage, TRUSTED_DEVICE_KEY);
+        return false;
+      }
+      throw error;
+    }
+  }
   async function openChat() {
+    const chatTitle = document.querySelector("#chatTitle");
+    chatTitle.textContent = pairing.deviceName || "设备互联";
+    await loadMessages();
     pairScreen.style.display = "none";
     chatApp.style.display = "grid";
-    document.querySelector("#chatTitle").textContent = pairing.deviceName || "设备互联";
-    await loadMessages();
+    chatTitle.focus({ preventScroll: true });
     connectSocket();
   }
   async function loadMessages() {
     const result = await fetchJson("/api/messages", { headers: authHeaders() });
     setMessages(await decryptJson(result.data, `messages:${ownDeviceId}`));
   }
+  function scheduleTrustedReconnect(message) {
+    clearSession();
+    clearTimeout(reconnectTimer);
+    const status = document.querySelector("#status");
+    status.textContent = message;
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = void 0;
+      try {
+        await loadPairing();
+        if (!await resumeTrustedDevice()) return showPairing("设备授权已失效，请重新输入匹配码");
+        await loadMessages();
+        connectSocket();
+      } catch {
+        scheduleTrustedReconnect("连接暂时不可用，正在重试…");
+      }
+    }, 1800);
+  }
   function connectSocket() {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = void 0;
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     socket = new WebSocket(`${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`);
     const status = document.querySelector("#status");
@@ -368,14 +638,22 @@
     };
     socket.onclose = (event) => {
       status.className = "status";
-      if (event.code === 4001 || event.code === 4003) {
-        sessionStorage.removeItem("deviceLinkSession");
-        status.textContent = "授权已失效，请重新扫码";
-        showToast("设备授权已失效");
+      if (event.code === 4001) {
+        scheduleTrustedReconnect("授权已过期，正在自动恢复…");
         return;
       }
-      status.textContent = "连接已断开，正在重试…";
-      setTimeout(connectSocket, 1800);
+      if (event.code === 4000) {
+        clearSession();
+        status.textContent = "此设备已在其他页面连接";
+        showToast("当前连接已由另一页面接管");
+        return;
+      }
+      if (event.code === 4003) {
+        clearSession();
+        showPairing("连接校验失败，请重新打开页面");
+        return;
+      }
+      scheduleTrustedReconnect("连接已断开，正在自动恢复…");
     };
     socket.onmessage = async (event) => {
       try {
@@ -481,13 +759,53 @@
     clearOldStagedDownloads().catch(() => {
     });
     try {
+      const pairingContext = capturePairingContextFromUrl();
+      if (pairingContext.automatic) {
+        prepareAutoPairing(pairingContext.autoCode);
+        await autoConnectFromQr();
+        return;
+      }
+      showManualPairing();
       await loadPairing();
-      if (await restore()) await openChat();
+      if (await restoreSession()) {
+        try {
+          await openChat();
+          return;
+        } catch (error) {
+          clearSession();
+          if (error.status !== 401) throw error;
+        }
+      }
+      if (await resumeTrustedDevice()) {
+        await openChat();
+        return;
+      }
+      await autoConnectFromQr();
     } catch (error) {
       pairError.textContent = error.message;
     }
   }
   document.querySelector("#pairButton").onclick = pair;
+  manualPairButton.onclick = () => {
+    scannedPairingContext = void 0;
+    pairCode.value = "";
+    showManualPairing(manualFallbackMessage);
+    pairCode.focus();
+  };
+  retryChatButton.onclick = async () => {
+    retryChatButton.disabled = true;
+    retryChatButton.textContent = "正在重试…";
+    autoPairError.textContent = "";
+    try {
+      await openSavedChat(recoveryTrustedSaved);
+    } catch (error) {
+      autoPairError.textContent = `仍无法进入会话：${error.message}`;
+      if (error.status === 401) manualPairButton.hidden = false;
+    } finally {
+      retryChatButton.disabled = false;
+      retryChatButton.textContent = "重试进入会话";
+    }
+  };
   document.querySelector("#conversationSelect").onchange = (e) => {
     currentConversationId = e.target.value === "shared" ? "shared" : `device:${ownDeviceId}`;
     renderMessages();

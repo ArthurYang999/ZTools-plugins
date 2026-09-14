@@ -1,6 +1,31 @@
 # Changelog
 
-## \[1.2.0] - 2026-08-20
+## 1.4.0 - 2026-08-27
+
+### ✨ Features
+
+* **完整备份 / 恢复** — 导入导出从「仅提示词裸数组」升级为结构化数据包（`promptforge-backup` 格式），涵盖提示词、项目、设置、历史记录；导入时合并去重、`projectId` 完整性校验（指向不存在项目的提示词自动转为资产）、settings 逐字段合并；内置种子数据（教程提示词）导出时自动排除；兼容旧版裸数组格式
+
+### 🐛 Bug Fixes
+
+* **设置覆盖主题丢失** — 修复保存行为设置时覆盖整个 settings 文档、导致主题（theme）字段丢失的问题，改为合并写入
+
+## 1.3.0 - 2026-08-25
+
+### ✨ Features
+
+* **Markdown 渲染预览** — FillPanel 预览区与 ManageView 编辑页新增「文本 / Markdown」「编辑 / 预览」切换按钮，基于 markdown-it 渲染（`html: false` 防 XSS），支持标题、列表、代码块、引用、表格、链接等；渲染顺序为先替换变量再渲染 Markdown
+* **使用统计分析面板** — 空间页新增「统计」tab，手写 SVG 可视化仪表盘：总提示词数 / 累计使用 / 收藏 / 含变量四个指标卡、类型分布环形图、使用 TOP10（本周 / 本月切换）、使用频次趋势折线图（基于历史记录按日期聚合）
+
+### 🎨 Design
+
+* **UI 图标现代化** — 引入 lucide-vue-next 图标库，将全部 emoji 图标（侧栏导航、右键菜单、卡片元信息、面板标题、关闭 / 移动按钮等）替换为统一的线条图标，按需 tree-shake（JS 仅 +14KB）
+
+### ⚡ Enhancement
+
+* **无变量提示词全宽预览** — 点击不含变量的提示词时隐藏「填写变量」表单区域，预览占满全部显示空间；含变量时保持左右分栏
+
+## 1.2.0 - 2026-08-20
 
 ### ✨ Features
 
@@ -27,7 +52,7 @@
 * **SpaceView 组件拆分** — 从 608 行拆分为 SpaceView（210 行）+ SpaceSidebar / ProjectPanel / HistoryPanel / TrashPanel 四个子组件
 * **ManageView 组件拆分** — 从 477 行拆分为 ManageView（280 行）+ ManageContentTab / ManagePropsTab / ManageVarsTab / ManageVersionsTab / ManageStatsTab 五个 Tab 子组件
 
-## \[1.1.0] - 2026-07-14
+## 1.1.0 - 2026-07-14
 
 ### ✨ Features
 
@@ -52,7 +77,7 @@
 * **存储错误处理统一** — `storage.ts` 所有 `catch` 块统一添加 `console.error` 日志，`save` 函数补全 `try-catch`
 * **ManageView 搜索性能优化** — `filteredItems` 拆分为 `baseItems` + `fuseInstance` + `filteredItems` 三层计算属性，Fuse 索引仅在基础列表变化时重建，避免每次按键重新实例化
 
-## \[1.0.0] - 2026-07-11
+## 1.0.0 - 2026-07-11
 
 ### 🐛 Bug Fixes
 
@@ -77,3 +102,6 @@
 
 * 移除未使用的 `fnvHash` 函数（精确重复检测改为字符串比对后不再需要）
 
+### 根据提交记录补充
+
+- 添加图标

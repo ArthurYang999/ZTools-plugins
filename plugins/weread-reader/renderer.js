@@ -191,7 +191,7 @@
     }
 
     body.wr_page_reader.ztools-reader-menu-open .readerControls {
-      top: 258px !important;
+      top: var(--ztools-reader-controls-top, 305px) !important;
       right: 8px !important;
       width: 154px !important;
       height: auto !important;
@@ -283,6 +283,7 @@
   const statusText = document.getElementById('statusText')
   const backButton = document.getElementById('backButton')
   const cleanModeButton = document.getElementById('cleanModeButton')
+  const singleLineButton = document.getElementById('singleLineButton')
   const menuButton = document.getElementById('menuButton')
   const menuPanel = document.getElementById('menuPanel')
 
@@ -297,6 +298,15 @@
   let readerThemeRequestId = 0
   let readerThemeRequestInFlight = false
   let hostThemeReconcileTimer = null
+  let singleLinePageKey = ''
+  let singleLinePageLoading = false
+  let singleLinePages = []
+  let singleLineDisplayIndex = -1
+  let singleLineWebviewIndex = -1
+  let singleLinePrefetchPromise = null
+  let singleLineGeneration = 0
+  let singleLineReachedEnd = false
+  let singleLineNavigationAt = 0
 
   function setStatus(message) {
     statusText.textContent = message
@@ -357,8 +367,17 @@
 
   function setRemoteMenuOpen(isOpen) {
     try {
+      const menuRect = menuPanel.getBoundingClientRect()
+      const webviewRect = webview.getBoundingClientRect()
+      const remoteMenuTop = Math.max(8, Math.ceil(menuRect.bottom - webviewRect.top + 8))
       const result = webview.executeJavaScript(
-        `document.body.classList.toggle('ztools-reader-menu-open', ${Boolean(isOpen)})`,
+        `(() => {
+          document.documentElement.style.setProperty(
+            '--ztools-reader-controls-top',
+            '${remoteMenuTop}px'
+          )
+          document.body.classList.toggle('ztools-reader-menu-open', ${Boolean(isOpen)})
+        })()`,
         true,
       )
       if (result && typeof result.catch === 'function') result.catch(function ignore() {})
@@ -397,6 +416,85 @@
       )
       if (result && typeof result.catch === 'function') result.catch(function ignore() {})
     } catch (error) {}
+  }
+
+  async function installSingleLineCanvasCapture() {
+    try {
+      return Boolean(
+        await webview.executeJavaScript(
+          `(() => {
+            if (window.__ztoolsSingleLineCanvasCapture?.version === 3) return true
+
+            const prototype = window.CanvasRenderingContext2D?.prototype
+            const originalFillText = prototype?.fillText
+            const originalClearRect = prototype?.clearRect
+            if (
+              !prototype ||
+              typeof originalFillText !== 'function' ||
+              typeof originalClearRect !== 'function'
+            ) {
+              return false
+            }
+
+            const entriesByCanvas = new WeakMap()
+            prototype.clearRect = function clearSingleLineCapture() {
+              const record = entriesByCanvas.get(this.canvas)
+              if (record) {
+                record.entries = []
+                record.positions.clear()
+              }
+              return originalClearRect.apply(this, arguments)
+            }
+            prototype.fillText = function captureSingleLineText(text, x, y, maxWidth) {
+              let record = entriesByCanvas.get(this.canvas)
+              if (!record) {
+                record = { entries: [], positions: new Set() }
+                entriesByCanvas.set(this.canvas, record)
+              }
+              const positionKey = [String(this.font || ''), Number(x), Number(y)].join('\\u0000')
+              if (record.positions.has(positionKey)) {
+                record.entries = []
+                record.positions.clear()
+              }
+              record.positions.add(positionKey)
+              record.entries.push({
+                text: String(text || ''),
+                x: Number(x),
+                y: Number(y),
+                font: String(this.font || '')
+              })
+              return originalFillText.apply(this, arguments)
+            }
+
+            window.__ztoolsSingleLineCanvasCapture = {
+              version: 3,
+              read() {
+                const output = []
+                const canvases = Array.from(
+                  document.querySelectorAll('.readerChapterContent canvas')
+                )
+                canvases.forEach((canvas, canvasIndex) => {
+                  const rect = canvas.getBoundingClientRect()
+                  const scaleY = rect.height > 0 ? canvas.height / rect.height : 1
+                  for (const entry of entriesByCanvas.get(canvas)?.entries || []) {
+                    output.push({
+                      ...entry,
+                      canvasIndex,
+                      screenY: rect.top + entry.y / scaleY
+                    })
+                  }
+                })
+                return output
+              }
+            }
+            return true
+          })()`,
+          true,
+        ),
+      )
+    } catch (error) {
+      return false
+    }
   }
 
   function setLoading(isLoading) {
@@ -449,6 +547,7 @@
     document.body.classList.toggle('is-reader-mode', cleanModeActive)
     if (!cleanModeActive) setMenuOpen(false)
     cleanModeButton.hidden = !readerPage
+    singleLineButton.hidden = !readerPage
     cleanModeButton.setAttribute('aria-pressed', String(cleanModeActive))
     cleanModeButton.textContent = cleanModeActive ? '原版界面' : '纯净阅读'
     cleanModeButton.title = cleanModeActive ? '恢复微信读书原版界面' : '启用纯净阅读'
@@ -692,6 +791,523 @@
     }
   }
 
+  async function extractSingleLineSnapshot() {
+    try {
+      const snapshot = await webview.executeJavaScript(
+        `(async () => {
+          const normalizeText = (value) => String(value || '').replace(/\\s+/g, ' ').trim()
+          const cleanCanvasText = (value) => String(value || '').replace(/[\\u200b-\\u200d\\ufeff]/g, '')
+          const isNavigationLabel = (value) =>
+            /^(上一章|下一章|上章|下章|上一节|下一节|上一页|下一页)$/.test(normalizeText(value))
+
+          function captureVerticalCanvasChapter() {
+            if (document.querySelector('.wr_horizontalReader')) return null
+            const entries = window.__ztoolsSingleLineCanvasCapture?.read?.() || []
+            if (!entries.length) return null
+
+            const fontTotals = new Map()
+            for (const entry of entries) {
+              const text = cleanCanvasText(entry.text)
+              if (!text) continue
+              const fontSize = (Number.parseFloat(entry.font) || 0).toFixed(1)
+              fontTotals.set(fontSize, (fontTotals.get(fontSize) || 0) + text.length)
+            }
+            const bodyFont = Array.from(fontTotals.entries()).sort(
+              (left, right) => right[1] - left[1]
+            )[0]?.[0]
+            if (!bodyFont) return null
+
+            const bodyEntries = entries
+              .filter(
+                (entry) => (Number.parseFloat(entry.font) || 0).toFixed(1) === bodyFont
+              )
+              .sort(
+                (left, right) =>
+                  left.canvasIndex - right.canvasIndex || left.y - right.y || left.x - right.x
+              )
+            const rows = []
+            for (const entry of bodyEntries) {
+              const text = cleanCanvasText(entry.text)
+              if (!text) continue
+              let row = rows[rows.length - 1]
+              if (
+                !row ||
+                row.canvasIndex !== entry.canvasIndex ||
+                Math.abs(row.y - entry.y) >= 1
+              ) {
+                row = {
+                  canvasIndex: entry.canvasIndex,
+                  y: entry.y,
+                  screenY: entry.screenY,
+                  text: ''
+                }
+                rows.push(row)
+              }
+              row.text += text
+            }
+
+            const textRows = rows
+              .map((row) => ({ ...row, text: normalizeText(row.text) }))
+              .filter((row) => row.text && !isNavigationLabel(row.text))
+            if (!textRows.length) return null
+
+            let initialLine = textRows.findIndex(
+              (row) => row.screenY >= 0 && row.screenY < window.innerHeight
+            )
+            if (initialLine < 0) initialLine = textRows.findIndex((row) => row.screenY >= 0)
+            if (initialLine < 0) initialLine = textRows.length - 1
+
+            const heading = document.querySelector(
+              '.readerTopBar_title_chapter, .readerTopBar_title, .readerChapterContent_title'
+            )
+            return {
+              title: normalizeText(heading?.innerText || document.title) || '微信读书',
+              readerUrl: location.href,
+              lines: textRows.map((row) => row.text),
+              initialLine,
+              mode: 'vertical'
+            }
+          }
+
+          function captureHorizontalCanvasPage() {
+            if (!document.querySelector('.wr_horizontalReader canvas')) return null
+            const entries = window.__ztoolsSingleLineCanvasCapture?.read?.() || []
+            if (!entries.length) return null
+
+            const fontTotals = new Map()
+            for (const entry of entries) {
+              const fontSize = (Number.parseFloat(entry.font) || 0).toFixed(1)
+              fontTotals.set(fontSize, (fontTotals.get(fontSize) || 0) + entry.text.length)
+            }
+            const bodyFont = Array.from(fontTotals.entries()).sort(
+              (left, right) => right[1] - left[1]
+            )[0]?.[0]
+            if (!bodyFont) return null
+
+            const rows = []
+            for (const entry of entries.sort((left, right) => left.y - right.y || left.x - right.x)) {
+              if ((Number.parseFloat(entry.font) || 0).toFixed(1) !== bodyFont) continue
+              const text = cleanCanvasText(entry.text)
+              if (!text) continue
+              let row = rows.find((item) => Math.abs(item.y - entry.y) < 1)
+              if (!row) {
+                row = { y: entry.y, text: '' }
+                rows.push(row)
+              }
+              row.text += text
+            }
+
+            const rowTexts = rows.map((row) => normalizeText(row.text)).filter(Boolean)
+            const pageText = rowTexts.reduce((text, rowText) => {
+              const separator = /[A-Za-z0-9]$/.test(text) && /^[A-Za-z0-9]/.test(rowText) ? ' ' : ''
+              return text + separator + rowText
+            }, '')
+            if (!pageText) return null
+            const heading = document.querySelector(
+              '.renderTargetPageInfo_header, .readerTopBar_title, .readerChapterContent_title'
+            )
+            return {
+              title: normalizeText(heading?.innerText || document.title) || '微信读书',
+              readerUrl: location.href,
+              lines: [pageText],
+              initialLine: 0,
+              mode: 'horizontal'
+            }
+          }
+
+          const verticalCanvasSnapshot = captureVerticalCanvasChapter()
+          if (verticalCanvasSnapshot) return verticalCanvasSnapshot
+          const canvasSnapshot = captureHorizontalCanvasPage()
+          if (canvasSnapshot) return canvasSnapshot
+
+          const containers = [
+            document.querySelector('.readerChapterContent:not(:has(canvas))'),
+            document.querySelector('.readerContent .app_content:not(:has(canvas))'),
+            document.querySelector('.app_content:not(.app_content_in_reader):not(:has(canvas))')
+          ].filter(Boolean)
+          const container = containers.find((node) => normalizeText(node.innerText))
+          if (!container) return null
+
+          const lines = []
+          for (const rawLine of String(container.innerText || '').split(/\\n+/)) {
+            const text = normalizeText(rawLine)
+            if (!text || isNavigationLabel(text) || text === lines[lines.length - 1]) continue
+            lines.push(text)
+            if (lines.length >= 2000) break
+          }
+
+          if (!lines.length) return null
+          const blockNodes = Array.from(container.querySelectorAll('h1, h2, h3, p, blockquote, li'))
+          const visibleNode = blockNodes.find((node) => {
+            const rect = node.getBoundingClientRect()
+            return rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight
+          })
+          const visibleText = normalizeText(visibleNode?.innerText || visibleNode?.textContent)
+          const visibleIndex = visibleText
+            ? lines.findIndex((line) => line === visibleText || line.includes(visibleText) || visibleText.includes(line))
+            : -1
+          const heading = document.querySelector(
+            '.readerTopBar_title, .readerChapterContent_title, .readerContentHeader, .readerChapterContent h1'
+          )
+          return {
+            title: normalizeText(heading?.innerText || document.title) || '微信读书',
+            readerUrl: location.href,
+            lines,
+            initialLine: visibleIndex >= 0 ? visibleIndex : 0,
+            mode: 'dom'
+          }
+        })()`,
+        true,
+      )
+
+      if (!snapshot || !Array.isArray(snapshot.lines) || !snapshot.lines.length) return null
+      const readerUrl = bridge.normalizeWereadUrl(snapshot.readerUrl) || getCurrentUrl()
+      const pageKey = snapshot.lines.join('\n')
+      return {
+        title: snapshot.title,
+        readerUrl,
+        lines: snapshot.lines,
+        initialLine: snapshot.initialLine,
+        pageKey,
+        mode: snapshot.mode || 'dom',
+      }
+    } catch (error) {
+      return null
+    }
+  }
+
+  async function prepareSingleLineNavigation(direction) {
+    const isPrevious = direction === 'previous'
+    try {
+      return await webview.executeJavaScript(
+        `(async () => {
+          const normalizeText = (value) => String(value || '').replace(/\\s+/g, ' ').trim()
+          const enabled = (element) => {
+            if (!element || element.disabled || element.getAttribute('aria-disabled') === 'true') {
+              return false
+            }
+            const rect = element.getBoundingClientRect()
+            return rect.width > 0 && rect.height > 0
+          }
+          const pageSelector = ${isPrevious ? "'.renderTarget_pager_button_left:not([disabled])'" : "'.renderTarget_pager_button_right:not([disabled])'"}
+          const chapterSelector = ${isPrevious ? "'.readerContentHeader button:not([disabled])'" : "'.readerFooter_button:not([disabled])'"}
+          const labels = ${isPrevious ? "['上一章', '上章', '上一节', '上一页']" : "['下一章', '下章', '下一节', '下一页']"}
+
+          let target = document.querySelector(pageSelector)
+          if (!enabled(target)) {
+            target = document.querySelector(chapterSelector)
+          }
+          if (!enabled(target)) {
+            target = Array.from(document.querySelectorAll('button, a, [role="button"]')).find(
+              (element) =>
+                enabled(element) &&
+                labels.includes(
+                  normalizeText(element.innerText || element.textContent || element.title)
+                )
+            )
+          }
+          if (!enabled(target)) return null
+
+          const invoked =
+            typeof window.__ztoolsSingleLineInvokeClick === 'function' &&
+            window.__ztoolsSingleLineInvokeClick(target)
+          if (invoked) return { invoked: true, x: 0, y: 0 }
+
+          target.scrollIntoView({ block: 'center', inline: 'center' })
+          await new Promise((resolve) => setTimeout(resolve, 160))
+          const rect = target.getBoundingClientRect()
+          return {
+            invoked: false,
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2)
+          }
+        })()`,
+        true,
+      )
+    } catch (error) {
+      return null
+    }
+  }
+
+  function sendSingleLineNavigationInput(target) {
+    if (!target) return false
+    try {
+      webview.focus()
+      webview.sendInputEvent({ type: 'mouseMove', x: target.x, y: target.y })
+      webview.sendInputEvent({
+        type: 'mouseDown',
+        x: target.x,
+        y: target.y,
+        button: 'left',
+        clickCount: 1,
+      })
+      webview.sendInputEvent({
+        type: 'mouseUp',
+        x: target.x,
+        y: target.y,
+        button: 'left',
+        clickCount: 1,
+      })
+      return true
+    } catch (error) {
+      return false
+    }
+  }
+
+  async function waitForSingleLineSnapshot(previousPageKey) {
+    await wait(500)
+    let candidate = null
+    let stableChecks = 0
+    for (let attempt = 0; attempt < 14; attempt += 1) {
+      await wait(180)
+      const snapshot = await extractSingleLineSnapshot()
+      if (!snapshot || snapshot.pageKey === previousPageKey) {
+        candidate = null
+        stableChecks = 0
+        continue
+      }
+      if (snapshot.pageKey === candidate?.pageKey) stableChecks += 1
+      else {
+        candidate = snapshot
+        stableChecks = 1
+      }
+      if (stableChecks >= 2) return candidate
+    }
+    return null
+  }
+
+  async function navigateSingleLineWebview(direction, previousPageKey) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const cooldown = 6000 - (Date.now() - singleLineNavigationAt)
+      if (cooldown > 0) await wait(cooldown)
+
+      const target = await prepareSingleLineNavigation(direction)
+      if (!target) return { boundary: true, snapshot: null }
+      if (!target.invoked && !sendSingleLineNavigationInput(target)) {
+        return { boundary: false, snapshot: null }
+      }
+      singleLineNavigationAt = Date.now()
+
+      const snapshot = await waitForSingleLineSnapshot(previousPageKey)
+      if (snapshot) return { boundary: false, snapshot }
+    }
+    return { boundary: false, snapshot: null }
+  }
+
+  function resetSingleLinePages(snapshot) {
+    singleLinePages = [snapshot]
+    singleLineDisplayIndex = 0
+    singleLineWebviewIndex = 0
+    singleLinePageKey = snapshot.pageKey
+    singleLineReachedEnd = false
+  }
+
+  function singleLinePrefetchAhead() {
+    return singleLinePages[singleLineDisplayIndex]?.mode === 'horizontal' ? 3 : 1
+  }
+
+  async function alignSingleLineWebview(targetIndex, generation) {
+    while (singleLineWebviewIndex !== targetIndex) {
+      if (generation !== singleLineGeneration) return false
+      const direction = singleLineWebviewIndex > targetIndex ? 'previous' : 'next'
+      const nextIndex = singleLineWebviewIndex + (direction === 'previous' ? -1 : 1)
+      const anchor = singleLinePages[singleLineWebviewIndex]
+      const expected = singleLinePages[nextIndex]
+      if (!anchor || !expected) return false
+
+      const result = await navigateSingleLineWebview(direction, anchor.pageKey)
+      if (
+        generation !== singleLineGeneration ||
+        !result.snapshot ||
+        result.snapshot.pageKey !== expected.pageKey
+      ) {
+        return false
+      }
+      singleLineWebviewIndex = nextIndex
+    }
+    return true
+  }
+
+  async function prefetchSingleLinePages(generation) {
+    try {
+      const lastIndex = singleLinePages.length - 1
+      if (
+        singleLineWebviewIndex !== lastIndex &&
+        !(await alignSingleLineWebview(lastIndex, generation))
+      ) {
+        return
+      }
+
+      while (
+        generation === singleLineGeneration &&
+        singleLinePages.length - singleLineDisplayIndex - 1 < singleLinePrefetchAhead()
+      ) {
+        const anchor = singleLinePages[singleLineWebviewIndex]
+        if (!anchor) return
+        const result = await navigateSingleLineWebview('next', anchor.pageKey)
+        if (generation !== singleLineGeneration) return
+        if (result.boundary) {
+          singleLineReachedEnd = true
+          return
+        }
+        const snapshot = result.snapshot
+        if (!snapshot || singleLinePages.some((page) => page.pageKey === snapshot.pageKey)) return
+
+        singleLinePages.push(snapshot)
+        singleLineWebviewIndex = singleLinePages.length - 1
+        bridge.bufferNextSingleLineReader(snapshot)
+      }
+    } catch (error) {}
+  }
+
+  function scheduleSingleLinePrefetch() {
+    if (
+      singleLinePrefetchPromise ||
+      singleLineReachedEnd ||
+      singleLineDisplayIndex < 0 ||
+      !singleLinePages.length
+    ) {
+      return singleLinePrefetchPromise
+    }
+
+    const generation = singleLineGeneration
+    const promise = prefetchSingleLinePages(generation)
+    singleLinePrefetchPromise = promise
+    promise.finally(function finishSingleLinePrefetch() {
+      if (singleLinePrefetchPromise === promise) singleLinePrefetchPromise = null
+    })
+    return promise
+  }
+
+  function deliverSingleLinePage(index, direction) {
+    const snapshot = singleLinePages[index]
+    if (!snapshot) return false
+    singleLineDisplayIndex = index
+    singleLinePageKey = snapshot.pageKey
+    const delivered =
+      direction === 'previous'
+        ? bridge.prependSingleLineReader(snapshot)
+        : bridge.appendSingleLineReader(snapshot)
+    if (delivered) scheduleSingleLinePrefetch()
+    return delivered
+  }
+
+  function selectBufferedSingleLinePage(event) {
+    const pageKey = typeof event.detail?.pageKey === 'string' ? event.detail.pageKey : ''
+    const index = singleLinePages.findIndex((page) => page.pageKey === pageKey)
+    if (index < 0) return
+    singleLineDisplayIndex = index
+    singleLinePageKey = pageKey
+    scheduleSingleLinePrefetch()
+  }
+
+  async function restoreSingleLineWebview() {
+    const currentPage = singleLinePages[singleLineDisplayIndex]
+    if (!currentPage) return
+    if (singleLinePrefetchPromise) await singleLinePrefetchPromise
+    const generation = ++singleLineGeneration
+    if (!(await alignSingleLineWebview(singleLineDisplayIndex, generation))) return
+    resetSingleLinePages(currentPage)
+  }
+
+  async function openSingleLineReader() {
+    setMenuOpen(false)
+    if (!isReaderPage(getCurrentUrl())) {
+      setStatus('请先打开一本书，再使用单行阅读')
+      return
+    }
+
+    singleLineButton.disabled = true
+    setStatus('正在提取当前章节…')
+    try {
+      if (singleLinePrefetchPromise) await singleLinePrefetchPromise
+      singleLineGeneration += 1
+      await installSingleLineCanvasCapture()
+      let snapshot = null
+      for (let attempt = 0; attempt < 12 && !snapshot; attempt += 1) {
+        snapshot = await extractSingleLineSnapshot()
+        if (!snapshot) await wait(200)
+      }
+      if (!snapshot) {
+        setStatus('当前章节没有读取到正文，请刷新后重试')
+        return
+      }
+
+      resetSingleLinePages(snapshot)
+      const result = bridge.openSingleLineReader(snapshot)
+      setStatus(result?.ok ? '单行阅读窗口已打开' : result?.reason || '单行阅读窗口打开失败')
+      if (result?.ok) scheduleSingleLinePrefetch()
+    } finally {
+      singleLineButton.disabled = false
+    }
+  }
+
+  async function loadSingleLinePage(direction) {
+    if (singleLinePageLoading) {
+      bridge.finishSingleLinePage('正在准备相邻页面，请稍后继续滚动。')
+      return
+    }
+    singleLinePageLoading = true
+    const isPrevious = direction === 'previous'
+    const boundaryMessage = isPrevious ? '已经到达全书开头。' : '已经到达全书末尾。'
+    const failureMessage = isPrevious ? '上一页正文加载失败。' : '下一页正文加载失败。'
+
+    try {
+      const offset = isPrevious ? -1 : 1
+      let targetIndex = singleLineDisplayIndex + offset
+      if (targetIndex >= 0 && targetIndex < singleLinePages.length) {
+        if (!deliverSingleLinePage(targetIndex, direction)) bridge.finishSingleLinePage(failureMessage)
+        return
+      }
+
+      if (singleLinePrefetchPromise) await singleLinePrefetchPromise
+      targetIndex = singleLineDisplayIndex + offset
+      if (targetIndex >= 0 && targetIndex < singleLinePages.length) {
+        if (!deliverSingleLinePage(targetIndex, direction)) bridge.finishSingleLinePage(failureMessage)
+        return
+      }
+
+      const generation = singleLineGeneration
+      if (!(await alignSingleLineWebview(singleLineDisplayIndex, generation))) {
+        bridge.finishSingleLinePage(failureMessage)
+        return
+      }
+
+      const anchor = singleLinePages[singleLineWebviewIndex]
+      const result = await navigateSingleLineWebview(direction, anchor?.pageKey || singleLinePageKey)
+      if (generation !== singleLineGeneration) return
+      if (!result.snapshot) {
+        bridge.finishSingleLinePage(result.boundary ? boundaryMessage : failureMessage)
+        return
+      }
+
+      singleLineReachedEnd = false
+      if (isPrevious) {
+        singleLinePages.unshift(result.snapshot)
+        singleLineDisplayIndex += 1
+        singleLineWebviewIndex = 0
+        targetIndex = 0
+      } else {
+        singleLinePages.push(result.snapshot)
+        singleLineWebviewIndex = singleLinePages.length - 1
+        targetIndex = singleLineDisplayIndex + 1
+      }
+      if (!deliverSingleLinePage(targetIndex, direction)) bridge.finishSingleLinePage(failureMessage)
+    } catch (error) {
+      bridge.finishSingleLinePage(failureMessage)
+    } finally {
+      singleLinePageLoading = false
+    }
+  }
+
+  function loadNextSingleLinePage() {
+    return loadSingleLinePage('next')
+  }
+
+  function loadPreviousSingleLinePage() {
+    return loadSingleLinePage('previous')
+  }
+
   menuButton.addEventListener('click', function toggleReaderMenu(event) {
     event.stopPropagation()
     const willOpen = !document.body.classList.contains('menu-open')
@@ -753,6 +1369,12 @@
     applyReaderPresentation(getCurrentUrl())
   })
 
+  singleLineButton.addEventListener('click', openSingleLineReader)
+  window.addEventListener('weread:single-line:next-request', loadNextSingleLinePage)
+  window.addEventListener('weread:single-line:previous-request', loadPreviousSingleLinePage)
+  window.addEventListener('weread:single-line:select-page', selectBufferedSingleLinePage)
+  window.addEventListener('weread:single-line:closed', restoreSingleLineWebview)
+
   document.getElementById('externalButton').addEventListener('click', function openExternalFromMenu() {
     setMenuOpen(false)
     openCurrentInBrowser()
@@ -798,9 +1420,10 @@
     setStatus('微信读书已打开')
   })
 
-  webview.addEventListener('dom-ready', function onDomReady() {
+  webview.addEventListener('dom-ready', async function onDomReady() {
     setLoading(false)
     const currentUrl = getCurrentUrl()
+    await installSingleLineCanvasCapture()
     handleNavigation(currentUrl)
     applyReaderPresentation(currentUrl)
     scheduleHostThemeReconcile()

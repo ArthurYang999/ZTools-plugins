@@ -1,6 +1,7 @@
 import { computed, nextTick, onUnmounted, ref, type Ref } from "vue";
 import {
   filterResultsExcludingPaths,
+  getMatchPathQueryPlan,
   getNextSelectedPath,
   getNextVisibleCount,
   getRangeSelectedPaths,
@@ -10,11 +11,13 @@ import {
   type FinderSortMode,
   type SelectionMode,
 } from "../core/finderLogic";
+import { logger } from "../core/logger";
 
 interface UseFinderSearchOptions {
   pageSize: number;
   maxResults: number;
   buildQuery: () => string;
+  queryKeyword?: () => string;
   sortMode: Ref<FinderSortMode>;
   matchPathEnabled: Ref<boolean>;
 }
@@ -27,6 +30,7 @@ export function useFinderSearch({
   pageSize,
   maxResults,
   buildQuery,
+  queryKeyword,
   sortMode,
   matchPathEnabled,
 }: UseFinderSearchOptions) {
@@ -46,7 +50,7 @@ export function useFinderSearch({
       return activeItem.value ? [activeItem.value] : [];
     }
     const pathSet = new Set(selectedPaths.value);
-    return results.value.filter((item) => item.fullPath && pathSet.has(item.fullPath));
+    return results.value.filter((item) => pathSet.has(item.fullPath));
   });
 
   let searchTimer: number | undefined;
@@ -75,7 +79,8 @@ export function useFinderSearch({
     searchSequence += 1;
     const everythingQuery = buildQuery();
     const currentSortMode = sortMode.value;
-    const currentMatchPathEnabled = matchPathEnabled.value;
+    const currentKeyword = queryKeyword ? queryKeyword() : "";
+    const queryPlan = getMatchPathQueryPlan(matchPathEnabled.value, currentKeyword);
 
     if (!window.services.everything.isAvailable()) {
       results.value = [];
@@ -88,14 +93,14 @@ export function useFinderSearch({
     visibleCount.value = pageSize;
 
     try {
-      const nameResult = window.services.everything.query(
-        everythingQuery,
-        maxResults,
-        currentSortMode,
-        false,
-      );
-
-      if (currentMatchPathEnabled) {
+      const searchStart = performance.now();
+      if (queryPlan.mode === "dual") {
+        const nameResult = window.services.everything.query(
+          everythingQuery,
+          maxResults,
+          currentSortMode,
+          false,
+        );
         const matchPathResult = window.services.everything.query(
           everythingQuery,
           maxResults,
@@ -108,12 +113,25 @@ export function useFinderSearch({
         ).slice(0, maxResults);
         everythingTotal.value = matchPathResult.total;
       } else {
-        results.value = nameResult.items;
-        everythingTotal.value = nameResult.total;
+        const queryResult = window.services.everything.query(
+          everythingQuery,
+          maxResults,
+          currentSortMode,
+          queryPlan.matchPath,
+        );
+        results.value = queryResult.items;
+        everythingTotal.value = queryResult.total;
       }
+      logger.perf("Everything 检索", performance.now() - searchStart, {
+        query: everythingQuery,
+        mode: queryPlan.mode,
+        total: everythingTotal.value,
+        loaded: results.value.length,
+      });
       updateResultStatus();
       restoreSelection(options);
     } catch (error: unknown) {
+      logger.warn("Everything 检索失败:", error);
       results.value = [];
       everythingTotal.value = 0;
       statusText.value = error instanceof Error ? error.message : "搜索失败";
@@ -162,9 +180,7 @@ export function useFinderSearch({
         activePath.value = targetPath;
       }
     } else if (mode === "range") {
-      const visiblePaths = visibleResults.value
-        .map((r) => r.fullPath)
-        .filter((p): p is string => !!p);
+      const visiblePaths = visibleResults.value.map((r) => r.fullPath);
       const anchor = activePath.value || visiblePaths[0] || targetPath;
       selectedPaths.value = getRangeSelectedPaths(visiblePaths, anchor, targetPath);
     } else {
@@ -192,9 +208,7 @@ export function useFinderSearch({
   }
 
   function moveSelection(direction: -1 | 1) {
-    const paths = results.value
-      .map((item) => item.fullPath)
-      .filter((path): path is string => !!path);
+    const paths = results.value.map((item) => item.fullPath);
     const nextPath = getNextSelectedPath(paths, activePath.value, direction);
     if (!nextPath) return;
 

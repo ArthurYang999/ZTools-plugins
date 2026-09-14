@@ -1,23 +1,41 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import JobsList from './components/JobsList.vue'
 import BuildHistory from './components/BuildHistory.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import { useInstances } from './composables/useInstances'
 import { useFavorites } from './composables/useFavorites'
+import {
+  provideKeyboardNav,
+  focusedPanel,
+  cyclePanel,
+  type FocusedPanel
+} from './composables/useKeyboardNav'
 import type { JobInfo, Favorite } from './types'
+
+provideKeyboardNav()
+// 注意：根组件不能 inject 自己 provide 的内容（Vue 3 设计限制）
+// 直接 import 模块级 ref 用于本组件自己的状态访问
+const navFocusedPanel = focusedPanel
+const navCyclePanel = cyclePanel
 
 const { loadInstances, currentInstance, hasInstances } = useInstances()
 const { loadFavorites } = useFavorites()
 
-const selectedJob = ref<string | undefined>(undefined)
+const selectedJob = ref<string | undefined>(
+  window.ztools.dbStorage.getItem<string>('lastSelectedJob') || undefined
+)
 const showSettings = ref(false)
 const editInstanceId = ref<string | undefined>(undefined)
-const currentView = ref<string>('')
+const currentView = ref<string>(window.ztools.dbStorage.getItem<string>('lastView') || '')
 const autoSelectFirstJob = ref(false)
 const searchFocusKey = ref(0)
 const initialSearchQuery = ref('')
+
+const sidebarRef = ref<InstanceType<typeof Sidebar> | null>(null)
+const jobsListRef = ref<InstanceType<typeof JobsList> | null>(null)
+const buildHistoryRef = ref<InstanceType<typeof BuildHistory> | null>(null)
 
 /**
  * 处理收藏点击 - 跳转到收藏的视图并选中该 job
@@ -26,11 +44,14 @@ const handleFavoriteClick = (fav: Favorite) => {
   const targetView = fav.viewName || ''
   if (currentView.value !== targetView) {
     currentView.value = targetView
+    window.ztools.dbStorage.setItem('lastView', targetView)
     setTimeout(() => {
       selectedJob.value = fav.jobName
+      window.ztools.dbStorage.setItem('lastSelectedJob', fav.jobName)
     }, 100)
   } else {
     selectedJob.value = fav.jobName
+    window.ztools.dbStorage.setItem('lastSelectedJob', fav.jobName)
   }
 }
 
@@ -39,6 +60,9 @@ const handleFavoriteClick = (fav: Favorite) => {
  */
 const handleViewChange = (viewName: string) => {
   currentView.value = viewName
+  window.ztools.dbStorage.setItem('lastView', viewName)
+  selectedJob.value = undefined
+  window.ztools.dbStorage.removeItem('lastSelectedJob')
   autoSelectFirstJob.value = true
   setTimeout(() => {
     autoSelectFirstJob.value = false
@@ -49,7 +73,9 @@ const handleViewChange = (viewName: string) => {
  * 处理 Job 点击
  */
 const handleJobClick = (job: JobInfo) => {
-  selectedJob.value = job.name
+  const fullName = job.fullName || job.name
+  selectedJob.value = fullName
+  window.ztools.dbStorage.setItem('lastSelectedJob', fullName)
 }
 
 /**
@@ -70,6 +96,96 @@ const handleOpenSettings = () => {
   }
   showSettings.value = true
 }
+
+/**
+ * 新增实例 - 始终进入添加模式
+ */
+const handleAddInstance = () => {
+  editInstanceId.value = undefined
+  showSettings.value = true
+}
+
+/**
+ * 全局键盘事件分发
+ */
+const handleGlobalKeydown = (e: KeyboardEvent) => {
+  const target = e.target as HTMLElement | null
+  // 输入框里直接输入的文字不抢
+  if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+    return
+  }
+  // 修饰键：只认 Ctrl/Meta；其他修饰键不抢
+  if (e.altKey) return
+
+  const ctrlOrMeta = e.ctrlKey || e.metaKey
+
+  // 面板切换
+  if (e.key === 'ArrowLeft' && !ctrlOrMeta && !e.shiftKey) {
+    e.preventDefault()
+    navCyclePanel(-1)
+    return
+  }
+  if (e.key === 'ArrowRight' && !ctrlOrMeta && !e.shiftKey) {
+    e.preventDefault()
+    navCyclePanel(1)
+    return
+  }
+
+  // 当前面板的方法
+  const panel: FocusedPanel = navFocusedPanel.value
+  if (panel === 'sidebar') {
+    const ref = sidebarRef.value
+    if (!ref) return
+    if (!ctrlOrMeta && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault()
+      ref.moveInSiblings(e.key === 'ArrowUp' ? -1 : 1)
+      return
+    }
+    if (e.key === 'Enter' && !ctrlOrMeta && !e.shiftKey) {
+      e.preventDefault()
+      ref.primaryAction()
+      return
+    }
+  } else if (panel === 'jobs') {
+    const ref = jobsListRef.value
+    if (!ref) return
+    if (!ctrlOrMeta && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault()
+      ref.moveInSiblings(e.key === 'ArrowUp' ? -1 : 1)
+      return
+    }
+    if (!ctrlOrMeta && e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault()
+      ref.moveTree(e.key === 'ArrowUp' ? -1 : 1)
+      return
+    }
+    if (e.key === 'Enter' && !ctrlOrMeta && !e.shiftKey) {
+      e.preventDefault()
+      ref.primaryAction()
+      return
+    }
+    if (e.key === 'Enter' && ctrlOrMeta && !e.shiftKey) {
+      e.preventDefault()
+      ref.favoriteAction()
+      return
+    }
+  } else if (panel === 'history') {
+    const ref = buildHistoryRef.value
+    if (!ref) return
+    if (!ctrlOrMeta && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault()
+      ref.moveInSiblings(e.key === 'ArrowUp' ? -1 : 1)
+      return
+    }
+    if (e.key === 'Enter' && !ctrlOrMeta && !e.shiftKey) {
+      e.preventDefault()
+      ref.primaryAction()
+      return
+    }
+  }
+}
+
+window.addEventListener('keydown', handleGlobalKeydown)
 
 onMounted(async () => {
   await loadInstances()
@@ -92,16 +208,22 @@ onMounted(async () => {
     editInstanceId.value = undefined
   }
 })
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleGlobalKeydown)
+})
 </script>
 
 <template>
   <div class="app">
     <Sidebar
+      ref="sidebarRef"
       :current-view="currentView"
       :selected-job="selectedJob"
       @favorite-click="handleFavoriteClick"
       @view-change="handleViewChange"
       @open-settings="handleOpenSettings"
+      @add-instance="handleAddInstance"
     />
 
     <main class="main-content">
@@ -120,8 +242,9 @@ onMounted(async () => {
       </header>
 
       <div class="content-body">
-        <div class="jobs-panel">
+        <div class="jobs-panel" :class="{ 'is-keyboard-panel': navFocusedPanel === 'jobs' }">
           <JobsList
+            ref="jobsListRef"
             :selected-job="selectedJob"
             :current-view="currentView"
             :focus-key="searchFocusKey"
@@ -131,8 +254,8 @@ onMounted(async () => {
           />
         </div>
 
-        <div class="history-panel">
-          <BuildHistory :selected-job="selectedJob" />
+        <div class="history-panel" :class="{ 'is-keyboard-panel': navFocusedPanel === 'history' }">
+          <BuildHistory ref="buildHistoryRef" :selected-job="selectedJob" />
         </div>
       </div>
     </main>
@@ -247,10 +370,20 @@ body {
   flex: 1;
   overflow: hidden;
   border-right: 1px solid var(--border-color, #e0e0e0);
+  transition: box-shadow 0.15s;
+}
+
+.jobs-panel.is-keyboard-panel {
+  box-shadow: inset 0 0 0 1px var(--primary-color, #0078d4);
 }
 
 .history-panel {
   width: 320px;
   overflow: hidden;
+  transition: box-shadow 0.15s;
+}
+
+.history-panel.is-keyboard-panel {
+  box-shadow: inset 0 0 0 1px var(--primary-color, #0078d4);
 }
 </style>
