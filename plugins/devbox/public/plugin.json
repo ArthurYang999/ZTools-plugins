@@ -5,7 +5,7 @@
   "categories": ["development"],
   "description": "开发百宝箱，提供随机生成、Base64 编解码、URL 编解码、加密签名、二维码、文本压缩、文本转换、JSON 工具、开发辅助等常用工具集",
   "author": "咖啡八杯",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "main": "index.html",
   "preload": "preload/services.js",
   "logo": "logo.png",
@@ -75,7 +75,7 @@
     },
     {
       "code": "htmlpreview",
-      "explain": "粘贴或输入 HTML 代码，实时预览渲染效果，支持导出 HTML 文件",
+      "explain": "粘贴或输入 HTML 代码实时预览，支持常用标签片段插入、粘贴 Base64 自动包成图片标签、导出 HTML 文件",
       "icon": "logo.png",
       "cmds": ["html", "HTML", "预览", "html预览", "HTML预览", "htmlpreview", "网页预览"]
     },
