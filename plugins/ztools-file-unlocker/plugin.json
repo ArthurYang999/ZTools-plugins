@@ -3,7 +3,7 @@
   "title": "文件解锁器",
   "pluginName": "文件解锁器",
   "description": "查找并解除被占用文件，支持解锁、解锁并删除/重命名/移动、批量处理",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "zhanglei",
   "main": "index.html",
   "preload": "preload.js",
