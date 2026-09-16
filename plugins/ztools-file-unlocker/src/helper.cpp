@@ -11,7 +11,10 @@
 #include <restartmanager.h>
 #include <psapi.h>
 #include <shlwapi.h>
+#include <shlobj.h>
 #include <shellapi.h>
+#include <shldisp.h>
+#include <exdisp.h>
 #include <vector>
 #include <string>
 #include <iostream>
@@ -24,6 +27,8 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
 
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
@@ -82,6 +87,14 @@ struct ProcessHolderInfo {
     std::vector<ULONG_PTR> handles;
 };
 
+struct TargetFileInfo {
+    std::wstring originalPath;
+    std::wstring normPath;
+    std::wstring ntPath;
+    bool isDir = false;
+    std::map<DWORD, ProcessHolderInfo> holders;
+};
+
 // JSON 转义辅助函数
 std::string EscapeJsonString(const std::wstring& ws) {
     int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, NULL, 0, NULL, NULL);
@@ -91,7 +104,7 @@ std::string EscapeJsonString(const std::wstring& ws) {
 
     std::ostringstream o;
     for (char c : s) {
-        if (c == '"') o << "\\\"";
+        if (c == '"') o << "\"";
         else if (c == '\\') o << "\\\\";
         else if (c == '\b') o << "\\b";
         else if (c == '\f') o << "\\f";
@@ -197,7 +210,7 @@ void GetProcessDetails(DWORD pid, std::wstring& exePath, std::wstring& appName) 
     }
 }
 
-bool PathMatches(const std::wstring& candPath, const std::wstring& targetPath, bool targetIsDir) {
+inline bool PathMatches(const std::wstring& candPath, const std::wstring& targetPath, bool targetIsDir) {
     if (candPath.length() < targetPath.length()) return false;
     if (_wcsnicmp(candPath.c_str(), targetPath.c_str(), targetPath.length()) == 0) {
         if (candPath.length() == targetPath.length()) return true;
@@ -209,8 +222,126 @@ bool PathMatches(const std::wstring& candPath, const std::wstring& targetPath, b
     return false;
 }
 
-// ----------------- 引擎 1：极速扫描所有运行中进程自身 EXE 镜像 -----------------
-void ScanRunningProcessImagesFast(const std::wstring& targetDosPath, bool isDir, std::map<DWORD, ProcessHolderInfo>& results) {
+// ----------------- 辅助函数：从 IDispatch 提取选中的文件 -----------------
+void ExtractSelectedFromDispatch(IDispatch* pdisp, const std::wstring& normDesktop, std::vector<std::wstring>& result) {
+    if (!pdisp) return;
+    IWebBrowserApp* pwba = NULL;
+    if (SUCCEEDED(pdisp->QueryInterface(IID_IWebBrowserApp, (void**)&pwba)) && pwba) {
+        IServiceProvider* psp = NULL;
+        if (SUCCEEDED(pwba->QueryInterface(IID_IServiceProvider, (void**)&psp)) && psp) {
+            IShellBrowser* psb = NULL;
+            if (SUCCEEDED(psp->QueryService(SID_STopLevelBrowser, IID_IShellBrowser, (void**)&psb)) && psb) {
+                IShellView* psv = NULL;
+                if (SUCCEEDED(psb->QueryActiveShellView(&psv)) && psv) {
+                    IFolderView* pfv = NULL;
+                    if (SUCCEEDED(psv->QueryInterface(IID_IFolderView, (void**)&pfv)) && pfv) {
+                        IShellItemArray* psia = NULL;
+                        if (SUCCEEDED(pfv->Items(SVGIO_SELECTION, IID_IShellItemArray, (void**)&psia)) && psia) {
+                            DWORD itemCount = 0;
+                            psia->GetCount(&itemCount);
+                            for (DWORD j = 0; j < itemCount; j++) {
+                                IShellItem* psi = NULL;
+                                if (SUCCEEDED(psia->GetItemAt(j, &psi)) && psi) {
+                                    PWSTR pszPath = NULL;
+                                    if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath)) && pszPath) {
+                                        std::wstring norm = NormalizePath(pszPath);
+                                        CoTaskMemFree(pszPath);
+                                        if (!norm.empty() && _wcsicmp(norm.c_str(), normDesktop.c_str()) != 0) {
+                                            result.push_back(norm);
+                                        }
+                                    }
+                                    psi->Release();
+                                }
+                            }
+                            psia->Release();
+                        }
+                        pfv->Release();
+                    }
+                    psv->Release();
+                }
+                psb->Release();
+            }
+            psp->Release();
+        }
+        pwba->Release();
+    }
+}
+
+// ----------------- 获取资源管理器 & 桌面当前选中的文件 -----------------
+std::vector<std::wstring> GetExplorerSelectedFiles() {
+    std::vector<std::wstring> result;
+    CoInitialize(NULL);
+
+    wchar_t szDesktopDir[MAX_PATH] = { 0 };
+    SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, szDesktopDir);
+    std::wstring normDesktop = NormalizePath(szDesktopDir);
+
+    IShellWindows* psw = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&psw))) {
+        VARIANT vEmpty;
+        VariantInit(&vEmpty);
+        long hwndDesktop = 0;
+        IDispatch* pdispDesktop = NULL;
+        if (SUCCEEDED(psw->FindWindowSW(&vEmpty, &vEmpty, SWC_DESKTOP, &hwndDesktop, SWFO_NEEDDISPATCH, &pdispDesktop)) && pdispDesktop) {
+            ExtractSelectedFromDispatch(pdispDesktop, normDesktop, result);
+            pdispDesktop->Release();
+        }
+
+        long count = 0;
+        psw->get_Count(&count);
+        for (long i = 0; i < count; i++) {
+            VARIANT v;
+            V_VT(&v) = VT_I4;
+            V_I4(&v) = i;
+            IDispatch* pdisp = NULL;
+            if (SUCCEEDED(psw->Item(v, &pdisp)) && pdisp) {
+                ExtractSelectedFromDispatch(pdisp, normDesktop, result);
+                pdisp->Release();
+            }
+        }
+        psw->Release();
+    }
+    CoUninitialize();
+    return result;
+}
+
+// ----------------- 获取剪贴板中的文件 -----------------
+std::vector<std::wstring> GetClipboardFiles() {
+    std::vector<std::wstring> result;
+    if (OpenClipboard(NULL)) {
+        HANDLE hDrop = GetClipboardData(CF_HDROP);
+        if (hDrop) {
+            HDROP h = (HDROP)GlobalLock(hDrop);
+            if (h) {
+                UINT count = DragQueryFileW(h, 0xFFFFFFFF, NULL, 0);
+                for (UINT i = 0; i < count; i++) {
+                    wchar_t szPath[MAX_PATH * 2] = { 0 };
+                    if (DragQueryFileW(h, i, szPath, MAX_PATH * 2)) {
+                        result.push_back(NormalizePath(szPath));
+                    }
+                }
+                GlobalUnlock(hDrop);
+            }
+        } else {
+            HANDLE hText = GetClipboardData(CF_UNICODETEXT);
+            if (hText) {
+                LPCWSTR text = (LPCWSTR)GlobalLock(hText);
+                if (text) {
+                    std::wstring s(text);
+                    if (s.length() >= 3 && ((s[1] == L':' && (s[2] == L'\\' || s[2] == L'/')) || s.rfind(L"\\\\", 0) == 0)) {
+                        result.push_back(NormalizePath(s));
+                    }
+                    GlobalUnlock(hText);
+                }
+            }
+        }
+        CloseClipboard();
+    }
+    return result;
+}
+
+// ----------------- 引擎 1：批量极速扫描运行中进程自身 EXE 镜像 -----------------
+void ScanRunningProcessImagesBatch(std::vector<TargetFileInfo>& targets) {
     DWORD aProcesses[2048], cbNeeded, cProcesses;
     if (!EnumProcesses(aProcesses, sizeof(aProcesses), &cbNeeded)) return;
     cProcesses = cbNeeded / sizeof(DWORD);
@@ -227,28 +358,86 @@ void ScanRunningProcessImagesFast(const std::wstring& targetDosPath, bool isDir,
         DWORD size = sizeof(szExeName) / sizeof(wchar_t);
         if (QueryFullProcessImageNameW(hProcess, 0, szExeName, &size)) {
             std::wstring normExe = NormalizePath(szExeName);
-            if (PathMatches(normExe, targetDosPath, isDir)) {
-                auto& holder = results[pid];
-                holder.pid = pid;
-                holder.exePath = normExe;
-                const wchar_t* pName = PathFindFileNameW(normExe.c_str());
-                holder.appName = pName ? pName : L"";
-                holder.matchedPath = normExe;
-                holder.reason = L"RunningExecutable";
+            for (auto& t : targets) {
+                if (PathMatches(normExe, t.normPath, t.isDir)) {
+                    auto& holder = t.holders[pid];
+                    holder.pid = pid;
+                    holder.exePath = normExe;
+                    const wchar_t* pName = PathFindFileNameW(normExe.c_str());
+                    holder.appName = pName ? pName : L"";
+                    holder.matchedPath = normExe;
+                    holder.reason = L"RunningExecutable";
+                }
             }
         }
         CloseHandle(hProcess);
     }
 }
 
-// ----------------- 引擎 2：单次全局内核句柄极速扫描 -----------------
-void ScanSystemHandlesFast(const std::wstring& targetDosPath, bool isDir, std::map<DWORD, ProcessHolderInfo>& results) {
+// ----------------- 引擎 2：批量 Restart Manager 极速探测 -----------------
+void ScanWithRestartManagerBatch(std::vector<TargetFileInfo>& targets) {
+    std::vector<LPCWSTR> fileNames;
+    std::vector<size_t> targetIndices;
+
+    for (size_t i = 0; i < targets.size(); i++) {
+        if (!targets[i].isDir) {
+            fileNames.push_back(targets[i].normPath.c_str());
+            targetIndices.push_back(i);
+        }
+    }
+    if (fileNames.empty()) return;
+
+    DWORD dwSession;
+    WCHAR szSessionKey[CCH_RM_SESSION_KEY + 1] = { 0 };
+    DWORD dwError = RmStartSession(&dwSession, 0, szSessionKey);
+    if (dwError != ERROR_SUCCESS) return;
+
+    dwError = RmRegisterResources(dwSession, (UINT)fileNames.size(), &fileNames[0], 0, NULL, 0, NULL);
+    if (dwError == ERROR_SUCCESS) {
+        DWORD dwReason = 0;
+        UINT nProcInfoNeeded = 0;
+        UINT nProcInfo = 0;
+        dwError = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo, NULL, &dwReason);
+        if (dwError == ERROR_MORE_DATA && nProcInfoNeeded > 0) {
+            std::vector<RM_PROCESS_INFO> procInfos(nProcInfoNeeded);
+            nProcInfo = nProcInfoNeeded;
+            dwError = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo, &procInfos[0], &dwReason);
+            if (dwError == ERROR_SUCCESS) {
+                DWORD currentPid = GetCurrentProcessId();
+                for (UINT p = 0; p < nProcInfo; p++) {
+                    DWORD pid = procInfos[p].Process.dwProcessId;
+                    if (pid == 0 || pid == currentPid) continue;
+
+                    for (size_t idx : targetIndices) {
+                        auto& t = targets[idx];
+                        auto& item = t.holders[pid];
+                        item.pid = pid;
+                        if (procInfos[p].strAppName[0] && item.appName.empty()) {
+                            item.appName = procInfos[p].strAppName;
+                        }
+                        GetProcessDetails(pid, item.exePath, item.appName);
+                        item.matchedPath = t.normPath;
+                        if (item.reason.empty()) item.reason = L"RestartManager";
+                    }
+                }
+            }
+        }
+    }
+    RmEndSession(dwSession);
+}
+
+// ----------------- 引擎 3：快速全局内核句柄扫描 -----------------
+void ScanSystemHandlesBatch(std::vector<TargetFileInfo>& targets, const std::map<std::wstring, std::wstring>& devMap) {
     if (!g_NtQuerySystemInformation || !g_NtQueryObject) return;
 
-    auto devMap = GetDosDeviceMap();
-    std::wstring targetNtPath = DosPathToNtPath(targetDosPath, devMap);
-    std::wstring cleanDos = targetDosPath;
-    std::wstring cleanNt = targetNtPath;
+    bool needDeepScan = false;
+    for (const auto& t : targets) {
+        if (t.holders.empty() || t.isDir) {
+            needDeepScan = true;
+            break;
+        }
+    }
+    if (!needDeepScan) return;
 
     wchar_t tempPath[MAX_PATH] = { 0 };
     GetTempPathW(MAX_PATH, tempPath);
@@ -296,26 +485,22 @@ void ScanSystemHandlesFast(const std::wstring& targetDosPath, bool isDir, std::m
         DeleteFileW(tempFile);
     }
 
-    std::map<DWORD, HANDLE> processHandleCache;
-    std::vector<BYTE> nameBuffer(4096);
+    std::map<DWORD, HANDLE> procCache;
+    std::vector<BYTE> nameBuf(2048);
 
     for (ULONG_PTR i = 0; i < handleInfoEx->NumberOfHandles; i++) {
-        SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX& entry = handleInfoEx->Handles[i];
-
-        if (fileTypeIndex != 0 && entry.ObjectTypeIndex != fileTypeIndex) {
-            continue;
-        }
-
+        const SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX& entry = handleInfoEx->Handles[i];
+        if (fileTypeIndex != 0 && entry.ObjectTypeIndex != fileTypeIndex) continue;
         DWORD pid = (DWORD)entry.UniqueProcessId;
-        if (pid == 0 || pid == 4 || pid == currentPid) continue;
+        if (pid <= 4 || pid == currentPid) continue;
 
         HANDLE hProcess = NULL;
-        auto itP = processHandleCache.find(pid);
-        if (itP != processHandleCache.end()) {
-            hProcess = itP->second;
+        auto it = procCache.find(pid);
+        if (it != procCache.end()) {
+            hProcess = it->second;
         } else {
             hProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
-            processHandleCache[pid] = hProcess;
+            procCache[pid] = hProcess;
         }
         if (!hProcess) continue;
 
@@ -324,88 +509,56 @@ void ScanSystemHandlesFast(const std::wstring& targetDosPath, bool isDir, std::m
             continue;
         }
 
-        DWORD fileType = GetFileType(hDup);
-        if (fileType != FILE_TYPE_DISK) {
+        // 关键保护：必须校验是否是 DISK 文件，避免 NamedPipe 导致 NtQueryObject 挂起
+        DWORD fType = GetFileType(hDup);
+        if (fType != FILE_TYPE_DISK) {
             CloseHandle(hDup);
             continue;
         }
 
-        ULONG returnLen = 0;
-        status = g_NtQueryObject(hDup, (OBJECT_INFORMATION_CLASS)ObjectNameInformation, &nameBuffer[0], (ULONG)nameBuffer.size(), &returnLen);
-        if (status == STATUS_SUCCESS) {
-            POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)&nameBuffer[0];
+        ULONG retLen = 0;
+        NTSTATUS ntStatus = g_NtQueryObject(hDup, (OBJECT_INFORMATION_CLASS)ObjectNameInformation, &nameBuf[0], (ULONG)nameBuf.size(), &retLen);
+        if (ntStatus == STATUS_SUCCESS) {
+            POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)&nameBuf[0];
             if (nameInfo->Name.Buffer && nameInfo->Name.Length > 0) {
                 std::wstring objName(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(wchar_t));
 
-                bool matched = PathMatches(objName, cleanNt, isDir);
-                if (!matched) {
-                    std::wstring dosCand = NtPathToDosPath(objName, devMap);
-                    matched = PathMatches(dosCand, cleanDos, isDir);
-                }
-
-                if (matched) {
-                    auto& holder = results[pid];
-                    holder.pid = pid;
-                    holder.matchedPath = NtPathToDosPath(objName, devMap);
-                    if (holder.reason.empty()) {
-                        holder.reason = isDir ? L"DirectoryHandle" : L"FileHandle";
+                for (auto& target : targets) {
+                    bool matched = PathMatches(objName, target.ntPath, target.isDir);
+                    if (!matched) {
+                        std::wstring dosCand = NtPathToDosPath(objName, devMap);
+                        matched = PathMatches(dosCand, target.normPath, target.isDir);
                     }
-                    holder.handles.push_back(entry.HandleValue);
+
+                    if (matched) {
+                        auto& holder = target.holders[pid];
+                        holder.pid = pid;
+                        holder.matchedPath = target.normPath;
+                        if (holder.reason.empty()) {
+                            holder.reason = target.isDir ? L"DirectoryHandle" : L"FileHandle";
+                        }
+                        holder.handles.push_back(entry.HandleValue);
+                    }
                 }
             }
         }
-
         CloseHandle(hDup);
     }
 
-    for (auto& pair : processHandleCache) {
-        if (pair.second) CloseHandle(pair.second);
+    for (auto& p : procCache) {
+        if (p.second) CloseHandle(p.second);
     }
+
     VirtualFree(buffer, 0, MEM_RELEASE);
 
-    for (auto& pair : results) {
-        GetProcessDetails(pair.first, pair.second.exePath, pair.second.appName);
-    }
-}
-
-// ----------------- 引擎 3：Restart Manager 扫描 -----------------
-void ScanWithRestartManager(const std::wstring& targetPath, std::map<DWORD, ProcessHolderInfo>& results) {
-    DWORD dwSession;
-    WCHAR szSessionKey[CCH_RM_SESSION_KEY + 1] = { 0 };
-    DWORD dwError = RmStartSession(&dwSession, 0, szSessionKey);
-    if (dwError != ERROR_SUCCESS) return;
-
-    LPCWSTR rgsFileNames[] = { targetPath.c_str() };
-    dwError = RmRegisterResources(dwSession, 1, rgsFileNames, 0, NULL, 0, NULL);
-    if (dwError == ERROR_SUCCESS) {
-        DWORD dwReason = 0;
-        UINT nProcInfoNeeded = 0;
-        UINT nProcInfo = 0;
-        dwError = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo, NULL, &dwReason);
-        if (dwError == ERROR_MORE_DATA && nProcInfoNeeded > 0) {
-            std::vector<RM_PROCESS_INFO> procInfos(nProcInfoNeeded);
-            nProcInfo = nProcInfoNeeded;
-            dwError = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo, &procInfos[0], &dwReason);
-            if (dwError == ERROR_SUCCESS) {
-                for (UINT i = 0; i < nProcInfo; i++) {
-                    DWORD pid = procInfos[i].Process.dwProcessId;
-                    if (pid == 0 || pid == GetCurrentProcessId()) continue;
-                    auto& item = results[pid];
-                    item.pid = pid;
-                    if (procInfos[i].strAppName[0] && item.appName.empty()) {
-                        item.appName = procInfos[i].strAppName;
-                    }
-                    GetProcessDetails(pid, item.exePath, item.appName);
-                    item.matchedPath = targetPath;
-                    if (item.reason.empty()) item.reason = L"RestartManager";
-                }
-            }
+    for (auto& target : targets) {
+        for (auto& pair : target.holders) {
+            GetProcessDetails(pair.first, pair.second.exePath, pair.second.appName);
         }
     }
-    RmEndSession(dwSession);
 }
 
-// ----------------- 关闭远程进程的句柄 -----------------
+// ----------------- 关闭远程进程句柄 -----------------
 bool CloseRemoteHandle(DWORD pid, ULONG_PTR handleValue) {
     HANDLE hProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
     if (!hProcess) return false;
@@ -416,37 +569,82 @@ bool CloseRemoteHandle(DWORD pid, ULONG_PTR handleValue) {
     return res != FALSE;
 }
 
-// ----------------- 终止远程进程 -----------------
-bool KillProcessById(DWORD pid) {
-    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-    if (!hProcess) return false;
-    BOOL res = TerminateProcess(hProcess, 1);
-    CloseHandle(hProcess);
-    return res != FALSE;
+// ----------------- 重启 Windows 资源管理器 -----------------
+bool RestartExplorerShell() {
+    Sleep(300);
+    HINSTANCE hInst = ShellExecuteW(NULL, L"open", L"explorer.exe", NULL, NULL, SW_SHOWNORMAL);
+    return (INT_PTR)hInst > 32;
 }
 
-// ----------------- 将文件/文件夹移至回收站 -----------------
-bool MoveToRecycleBin(const std::wstring& targetPath) {
-    if (targetPath.empty()) return false;
-    
-    // SHFILEOPSTRUCTW 要求 pFrom 是以两个 null 字符结尾的字符串
-    std::vector<wchar_t> buffer(targetPath.length() + 2, 0);
-    wcsncpy_s(&buffer[0], buffer.size(), targetPath.c_str(), targetPath.length());
-    buffer[targetPath.length()] = L'\0';
-    buffer[targetPath.length() + 1] = L'\0';
+// ----------------- 终止远程进程 -----------------
+bool KillProcessById(DWORD pid, bool& wasExplorer) {
+    wasExplorer = false;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    if (!hProcess) {
+        hProcess = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    }
+    if (!hProcess) return false;
 
-    SHFILEOPSTRUCTW fileOp = { 0 };
-    fileOp.wFunc = FO_DELETE;
-    fileOp.pFrom = buffer.data();
-    fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    wchar_t szExeName[MAX_PATH * 2] = { 0 };
+    DWORD size = sizeof(szExeName) / sizeof(wchar_t);
+    if (QueryFullProcessImageNameW(hProcess, 0, szExeName, &size)) {
+        std::wstring norm = NormalizePath(szExeName);
+        std::transform(norm.begin(), norm.end(), norm.begin(), ::towlower);
+        if (norm.length() >= 12 && norm.substr(norm.length() - 12) == L"explorer.exe") {
+            wasExplorer = true;
+        }
+    }
 
-    int result = SHFileOperationW(&fileOp);
-    return (result == 0 && !fileOp.fAnyOperationsAborted);
+    BOOL res = TerminateProcess(hProcess, 1);
+    if (res) {
+        WaitForSingleObject(hProcess, 1500);
+    }
+    CloseHandle(hProcess);
+
+    if (res && wasExplorer) {
+        RestartExplorerShell();
+    }
+
+    return res != FALSE;
 }
 
 int wmain(int argc, wchar_t* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     EnableDebugPrivilege();
+
+    if (argc < 2) {
+        std::cout << "Usage:\n  unlocker-helper list <path1> [path2...]\n  unlocker-helper list-batch <path1> [path2...]\n  unlocker-helper get-selected\n  unlocker-helper kill <pid>\n  unlocker-helper restart-explorer\n  unlocker-helper close-handle <pid> <handleHex>\n";
+        return 0;
+    }
+
+    std::wstring cmd = argv[1];
+
+    if (cmd == L"restart-explorer") {
+        bool ok = RestartExplorerShell();
+        std::cout << "{\"ok\": " << (ok ? "true" : "false") << "}\n";
+        return ok ? 0 : 1;
+    }
+
+    if (cmd == L"get-selected") {
+        std::set<std::wstring> uniqueFiles;
+        auto expFiles = GetExplorerSelectedFiles();
+        for (const auto& f : expFiles) if (!f.empty()) uniqueFiles.insert(f);
+
+        if (uniqueFiles.empty()) {
+            auto clipFiles = GetClipboardFiles();
+            for (const auto& f : clipFiles) if (!f.empty()) uniqueFiles.insert(f);
+        }
+
+        std::cout << "[\n";
+        bool first = true;
+        for (const auto& f : uniqueFiles) {
+            if (!first) std::cout << ",\n";
+            first = false;
+            std::cout << "  \"" << EscapeJsonString(f) << "\"";
+        }
+        std::cout << "\n]\n";
+        return 0;
+    }
 
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
@@ -454,68 +652,91 @@ int wmain(int argc, wchar_t* argv[]) {
         g_NtQueryObject = (pfnNtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
     }
 
-    if (argc < 2) {
-        std::cout << "Usage:\n  unlocker-helper list <path>\n  unlocker-helper kill <pid>\n  unlocker-helper close-handle <pid> <handleHex>\n  unlocker-helper recycle <path>\n";
-        return 0;
-    }
+    if ((cmd == L"list" || cmd == L"list-batch") && argc >= 3) {
+        auto devMap = GetDosDeviceMap();
+        std::vector<TargetFileInfo> targets;
 
-    std::wstring cmd = argv[1];
-
-    if (cmd == L"recycle" && argc >= 3) {
-        std::wstring targetPath = NormalizePath(argv[2]);
-        bool ok = MoveToRecycleBin(targetPath);
-        std::cout << "{\"ok\": " << (ok ? "true" : "false") << "}\n";
-        return ok ? 0 : 1;
-    }
-
-    if (cmd == L"list" && argc >= 3) {
-        std::wstring targetPath = NormalizePath(argv[2]);
-
-        DWORD attrs = GetFileAttributesW(targetPath.c_str());
-        bool isDir = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_DIRECTORY);
-
-        std::map<DWORD, ProcessHolderInfo> results;
-
-        // 引擎 1：运行中进程自身 EXE 镜像扫描（极速遍历，彻底解决目录下运行的程序）
-        ScanRunningProcessImagesFast(targetPath, isDir, results);
-
-        // 引擎 2：内核句柄极速扫描（覆盖所有打开的文件/文件夹句柄）
-        ScanSystemHandlesFast(targetPath, isDir, results);
-
-        // 引擎 3：Restart Manager 扫描（单文件补充）
-        if (results.empty() && !isDir) {
-            ScanWithRestartManager(targetPath, results);
+        for (int i = 2; i < argc; i++) {
+            TargetFileInfo t;
+            t.originalPath = argv[i];
+            t.normPath = NormalizePath(argv[i]);
+            t.ntPath = DosPathToNtPath(t.normPath, devMap);
+            DWORD attrs = GetFileAttributesW(t.normPath.c_str());
+            t.isDir = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+            targets.push_back(t);
         }
 
-        std::cout << "[\n";
-        bool first = true;
-        for (const auto& pair : results) {
-            const auto& h = pair.second;
-            if (!first) std::cout << ",\n";
-            first = false;
+        // 极速 3 级流水线引擎
+        ScanRunningProcessImagesBatch(targets);
+        ScanWithRestartManagerBatch(targets);
+        ScanSystemHandlesBatch(targets, devMap);
 
-            std::cout << "  {\n";
-            std::cout << "    \"pid\": " << h.pid << ",\n";
-            std::cout << "    \"name\": \"" << EscapeJsonString(h.appName) << "\",\n";
-            std::cout << "    \"exe\": \"" << EscapeJsonString(h.exePath) << "\",\n";
-            std::cout << "    \"matchedPath\": \"" << EscapeJsonString(h.matchedPath) << "\",\n";
-            std::cout << "    \"reason\": \"" << EscapeJsonString(h.reason) << "\",\n";
-            std::cout << "    \"handles\": [";
-            for (size_t i = 0; i < h.handles.size(); i++) {
-                if (i > 0) std::cout << ", ";
-                std::cout << "\"0x" << std::hex << h.handles[i] << std::dec << "\"";
+        // 单路径调用且使用 'list' 时返回数组格式（向下兼容）
+        if (cmd == L"list" && targets.size() == 1) {
+            std::cout << "[\n";
+            bool first = true;
+            for (const auto& pair : targets[0].holders) {
+                const auto& h = pair.second;
+                if (!first) std::cout << ",\n";
+                first = false;
+
+                std::cout << "  {\n";
+                std::cout << "    \"pid\": " << h.pid << ",\n";
+                std::cout << "    \"name\": \"" << EscapeJsonString(h.appName) << "\",\n";
+                std::cout << "    \"exe\": \"" << EscapeJsonString(h.exePath) << "\",\n";
+                std::cout << "    \"matchedPath\": \"" << EscapeJsonString(h.matchedPath) << "\",\n";
+                std::cout << "    \"reason\": \"" << EscapeJsonString(h.reason) << "\",\n";
+                std::cout << "    \"handles\": [";
+                for (size_t i = 0; i < h.handles.size(); i++) {
+                    if (i > 0) std::cout << ", ";
+                    std::cout << "\"0x" << std::hex << h.handles[i] << std::dec << "\"";
+                }
+                std::cout << "]\n";
+                std::cout << "  }";
             }
-            std::cout << "]\n";
-            std::cout << "  }";
+            std::cout << "\n]\n";
+            return 0;
         }
-        std::cout << "\n]\n";
+
+        // 批量调用返回 JSON Map: { "path1": [ ... ], "path2": [ ... ] }
+        std::cout << "{\n";
+        bool firstTarget = true;
+        for (const auto& t : targets) {
+            if (!firstTarget) std::cout << ",\n";
+            firstTarget = false;
+
+            std::cout << "  \"" << EscapeJsonString(t.originalPath) << "\": [\n";
+            bool firstHolder = true;
+            for (const auto& pair : t.holders) {
+                const auto& h = pair.second;
+                if (!firstHolder) std::cout << ",\n";
+                firstHolder = false;
+
+                std::cout << "    {\n";
+                std::cout << "      \"pid\": " << h.pid << ",\n";
+                std::cout << "      \"name\": \"" << EscapeJsonString(h.appName) << "\",\n";
+                std::cout << "      \"exe\": \"" << EscapeJsonString(h.exePath) << "\",\n";
+                std::cout << "      \"matchedPath\": \"" << EscapeJsonString(h.matchedPath) << "\",\n";
+                std::cout << "      \"reason\": \"" << EscapeJsonString(h.reason) << "\",\n";
+                std::cout << "      \"handles\": [";
+                for (size_t i = 0; i < h.handles.size(); i++) {
+                    if (i > 0) std::cout << ", ";
+                    std::cout << "\"0x" << std::hex << h.handles[i] << std::dec << "\"";
+                }
+                std::cout << "]\n";
+                std::cout << "    }";
+            }
+            std::cout << "\n  ]";
+        }
+        std::cout << "\n}\n";
         return 0;
     }
 
     if (cmd == L"kill" && argc >= 3) {
         DWORD pid = (DWORD)_wtoi(argv[2]);
-        bool ok = KillProcessById(pid);
-        std::cout << "{\"ok\": " << (ok ? "true" : "false") << ", \"pid\": " << pid << "}\n";
+        bool wasExplorer = false;
+        bool ok = KillProcessById(pid, wasExplorer);
+        std::cout << "{\"ok\": " << (ok ? "true" : "false") << ", \"pid\": " << pid << ", \"restartedExplorer\": " << (wasExplorer ? "true" : "false") << "}\n";
         return ok ? 0 : 1;
     }
 

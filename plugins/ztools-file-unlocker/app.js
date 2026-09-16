@@ -9,6 +9,7 @@
   const els = {
     fileCountBadge: document.getElementById('fileCountBadge'),
     btnAdd: document.getElementById('btnAdd'),
+    btnSyncSelected: document.getElementById('btnSyncSelected'),
     btnRefreshAll: document.getElementById('btnRefreshAll'),
     btnUnlockAll: document.getElementById('btnUnlockAll'),
     btnDeleteAll: document.getElementById('btnDeleteAll'),
@@ -65,13 +66,23 @@
     return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
   function adjustHeight(h = 560) {
+    if (services.expandWindow) {
+      try { services.expandWindow(h); } catch (e) {}
+    }
     try {
-      if (ztools.setExpendHeight) ztools.setExpendHeight(h);
-      if (ztools.setExploresHeight) ztools.setExploresHeight(h);
+      if (typeof utools !== 'undefined' && utools.setExpendHeight) utools.setExpendHeight(h);
+      if (window.utools && window.utools.setExpendHeight) window.utools.setExpendHeight(h);
+      if (window.ztools && window.ztools.setExpendHeight) window.ztools.setExpendHeight(h);
+      if (ztools && ztools.setExpendHeight) ztools.setExpendHeight(h);
     } catch (e) {}
   }
   function pathName(p) { return String(p || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p; }
   function pathDir(p) { return String(p || '').replace(/[\\/]+[^\\/]+$/, '') || p; }
+  function isExplorer(s) {
+    if (!s) return false;
+    const l = String(s).toLowerCase();
+    return l.includes('explorer.exe') || l === 'explorer' || l.includes('资源管理器');
+  }
 
   /* ---------- Scanning ---------- */
   async function scanFile(idx) {
@@ -82,15 +93,13 @@
     renderFiles();
 
     try {
-      const res = await services.listHolders(f.path);
+      const [res, probeRes] = await Promise.all([
+        services.listHolders(f.path),
+        (!f.isDir && services.probeLock) ? services.probeLock(f.path) : Promise.resolve(null)
+      ]);
       f.holders = (res && res.holders) || [];
       f.scanErr = res && res.error ? res.error : '';
-
-      let probeLocked = null;
-      if (!f.isDir) {
-        const pr = await services.probeLock(f.path);
-        probeLocked = pr && pr.locked;
-      }
+      const probeLocked = probeRes && probeRes.locked;
       f.status = (f.holders.length > 0 || probeLocked === true) ? 'locked' : 'normal';
     } catch (e) {
       f.scanErr = e.message;
@@ -109,12 +118,37 @@
       return;
     }
     els.fileCountBadge.textContent = '扫描中 ' + files.length + ' 项';
-    for (let i = 0; i < files.length; i++) {
-      await scanFile(i);
-    }
+    files.forEach(f => { f.scanning = true; f.status = 'checking'; });
     renderFiles();
-    els.fileCountBadge.textContent = files.length + ' 项';
-    toast('占用状态已刷新', 'info');
+
+    try {
+      if (services.listHoldersBatch && files.length > 1) {
+        const batchRes = await services.listHoldersBatch(files.map(f => f.path));
+        await Promise.all(files.map(async (f, i) => {
+          const rawHolders = batchRes[f.path] || [];
+          f.holders = rawHolders.filter(h => h && h.pid > 0);
+          f.scanErr = '';
+          let probeLocked = false;
+          if (!f.isDir && services.probeLock) {
+            try {
+              const pr = await services.probeLock(f.path);
+              probeLocked = pr && pr.locked;
+            } catch (e) {}
+          }
+          f.status = (f.holders.length > 0 || probeLocked === true) ? 'locked' : 'normal';
+          f.scanning = false;
+        }));
+      } else {
+        await Promise.all(files.map((_, i) => scanFile(i)));
+      }
+    } catch (e) {
+      files.forEach(f => { f.scanning = false; f.status = 'normal'; });
+    } finally {
+      renderFiles();
+      renderHolderPanel();
+      els.fileCountBadge.textContent = files.length + ' 项';
+      toast('占用状态已刷新', 'info', 1800);
+    }
   }
 
   /* ---------- Render ---------- */
@@ -269,8 +303,13 @@
   }
 
   /* ---------- Add Paths ---------- */
-  async function addPaths(paths) {
+  async function addPaths(paths, replace = false) {
     if (!paths || !paths.length) return;
+    if (replace) {
+      files = [];
+      checked.clear();
+      selectedIndex = -1;
+    }
     const targetsToScan = [];
 
     for (const p of paths) {
@@ -297,19 +336,52 @@
     }
     if (!targetsToScan.length) return;
 
-    adjustHeight(Math.min(620, 360 + files.length * 10));
+    adjustHeight(560);
     selectedIndex = targetsToScan[0];
     renderFiles();
     renderHolderPanel();
 
-    for (const i of targetsToScan) {
+    // 并行获取文件/目录信息
+    await Promise.all(targetsToScan.map(async (i) => {
       const f = files[i];
-      if (!f) continue;
+      if (!f) return;
       try {
         const info = await services.getPathInfo(f.path);
         if (info && info.ok) { f.isDir = info.isDirectory; f.sizeStr = info.sizeStr; }
       } catch (e) {}
-      await scanFile(i);
+    }));
+
+    // 若添加多个文件，采用批量扫描引擎
+    if (services.listHoldersBatch && targetsToScan.length > 1) {
+      try {
+        const targetPaths = targetsToScan.map(i => files[i].path);
+        const batchRes = await services.listHoldersBatch(targetPaths);
+        await Promise.all(targetsToScan.map(async (i) => {
+          const f = files[i];
+          if (!f) return;
+          const rawHolders = batchRes[f.path] || [];
+          f.holders = rawHolders.filter(h => h && h.pid > 0);
+          f.scanErr = '';
+          let probeLocked = false;
+          if (!f.isDir && services.probeLock) {
+            try {
+              const pr = await services.probeLock(f.path);
+              probeLocked = pr && pr.locked;
+            } catch (e) {}
+          }
+          f.status = (f.holders.length > 0 || probeLocked === true) ? 'locked' : 'normal';
+          f.scanning = false;
+        }));
+      } catch (e) {
+        await Promise.all(targetsToScan.map(i => scanFile(i)));
+      } finally {
+        renderFiles();
+        if (selectedIndex >= 0) renderHolderPanel();
+      }
+    } else {
+      for (const i of targetsToScan) {
+        await scanFile(i);
+      }
     }
   }
 
@@ -317,26 +389,60 @@
     try {
       const paths = await services.selectPaths();
       if (paths && paths.length) {
-        addPaths(paths);
+        addPaths(paths, false);
       }
     } catch (e) {
       toast('打开选择对话框失败: ' + e.message, 'error');
     }
   }
 
-  /* ---------- Plugin Enter Handler ---------- */
-  window.onPluginEnter = function (action) {
-    if (!action) return;
-    let paths = [];
+  /* ---------- Plugin Enter Handler (Ztools / uTools) ---------- */
+  function extractPathsFromAction(action) {
+    if (!action) return [];
+    const extracted = [];
+
+    function addIfValid(p) {
+      if (!p) return;
+      const clean = String(p).trim().replace(/^["']|["']$/g, '');
+      if (clean && (clean.includes(':\\') || clean.includes(':/') || clean.startsWith('\\\\'))) {
+        extracted.push(clean);
+      }
+    }
+
     if (action.type === 'files' && Array.isArray(action.payload)) {
-      paths = action.payload.map(item => (typeof item === 'string' ? item : item && item.path)).filter(Boolean);
-    } else if (action.type === 'window' && action.payload && action.payload.path) {
-      paths = [action.payload.path];
-    } else if (typeof action.payload === 'string' && (action.payload.includes('\\') || action.payload.includes('/'))) {
-      paths = [action.payload];
+      action.payload.forEach(item => {
+        if (typeof item === 'string') addIfValid(item);
+        else if (item && item.path) addIfValid(item.path);
+      });
+    } else if (action.type === 'window' && action.payload) {
+      if (typeof action.payload === 'string') addIfValid(action.payload);
+      else if (action.payload.path) addIfValid(action.payload.path);
+    } else if (typeof action.payload === 'string') {
+      addIfValid(action.payload);
+    } else if (action.payload && typeof action.payload === 'object') {
+      if (action.payload.path) addIfValid(action.payload.path);
+    }
+
+    return extracted;
+  }
+
+  window.onPluginEnter = async function (action) {
+    adjustHeight(560);
+    setTimeout(() => adjustHeight(560), 50);
+    setTimeout(() => adjustHeight(560), 150);
+    setTimeout(() => adjustHeight(560), 300);
+
+    let paths = extractPathsFromAction(action);
+    // 如果 action 没能提取到路径（例如 Ztools 唤醒时未传参数），自动从系统 Shell / 剪贴板中检测当前选中的文件
+    if (paths.length === 0 && services.getSelectedFiles) {
+      try {
+        const autoPaths = await services.getSelectedFiles();
+        if (autoPaths && autoPaths.length) paths = autoPaths;
+      } catch (e) {}
     }
     if (paths.length > 0) {
-      addPaths(paths);
+      addPaths(paths, true); // 每次进入插件时只保留本次选中的文件
+      toast(`已载入选中的 ${paths.length} 项，正在检测占用...`, 'info', 2200);
     }
   };
 
@@ -347,8 +453,15 @@
     toast('正在结束占用进程并解锁：' + f.name + ' ...', 'info');
     const res = await services.unlockPath(f.path);
     await scanFile(idx);
-    if (res.ok) toast('已结束占用进程，成功解锁：' + f.name, 'success');
-    else toast('未能完全解锁：' + f.name + (res.message ? '（' + res.message + '）' : ''), 'error');
+    if (res.ok) {
+      if (res.restartedExplorer) {
+        toast('已解除占用（已自动重启资源管理器）：' + f.name, 'success', 3200);
+      } else {
+        toast('已结束占用进程，成功解锁：' + f.name, 'success');
+      }
+    } else {
+      toast('未能完全解锁：' + f.name + (res.message ? '（' + res.message + '）' : ''), 'error');
+    }
   }
 
   async function doUnlockRename(idx) {
@@ -421,12 +534,15 @@
     if (!files.length) return toast('没有已添加的文件', 'error');
     toast('正在批量解锁 ' + files.length + ' 项...', 'info');
     let fail = 0;
+    let hadExplorer = false;
     for (let i = 0; i < files.length; i++) {
       const res = await services.unlockPath(files[i].path);
       if (!res.ok) fail++;
+      if (res.restartedExplorer) hadExplorer = true;
     }
     await refreshAll();
-    toast(fail ? ('完成，' + fail + ' 项未能解锁') : '已全部解锁', fail ? 'error' : 'success');
+    const successMsg = hadExplorer ? '已全部解锁（已自动重启资源管理器）' : '已全部解锁';
+    toast(fail ? ('完成，' + fail + ' 项未能解锁') : successMsg, fail ? 'error' : 'success', 3200);
   }
 
   async function batchDelete() {
@@ -529,10 +645,17 @@
 
     els.btnDetailKill.onclick = async () => {
       els.processDetailModal.classList.remove('show');
-      const ok = await confirmDialog('结束进程？', '确认结束进程 <b style="color:var(--text-primary)">' + escapeHtml(h.name || h.pid) + '</b> (PID ' + h.pid + ') ？<br><span style="color:var(--accent-red)">将强制终止该进程并释放文件占用。</span>');
+      const isExp = isExplorer(h.name) || isExplorer(h.exe);
+      const promptTip = isExp 
+        ? '<br><span style="color:var(--accent-orange);font-size:12px">💡 提示：该进程为 Windows 资源管理器/桌面，结束后将自动为您重启桌面以防电脑异常。</span>'
+        : '<br><span style="color:var(--accent-red)">将强制终止该进程并释放文件占用。</span>';
+      const ok = await confirmDialog('结束进程？', '确认结束进程 <b style="color:var(--text-primary)">' + escapeHtml(h.name || h.pid) + '</b> (PID ' + h.pid + ') ？' + promptTip);
       if (!ok) return;
-      const res = await services.killProcess(h.pid, true);
-      toast(res.ok ? ('已结束进程：' + h.name) : ('结束失败：' + (res.message || '')), res.ok ? 'success' : 'error');
+      const res = await services.killProcess(h.pid, true, h.name || h.exe);
+      const msg = res.ok 
+        ? (res.restartedExplorer ? ('已结束资源管理器，正在自动重启桌面...') : ('已结束进程：' + h.name))
+        : ('结束失败：' + (res.message || ''));
+      toast(msg, res.ok ? 'success' : 'error', 3000);
       if (selectedIndex >= 0) await scanFile(selectedIndex);
     };
 
@@ -568,10 +691,17 @@
         toast(allOk ? '已关闭占用句柄' : '部分句柄关闭失败', allOk ? 'success' : 'error');
         if (selectedIndex >= 0) await scanFile(selectedIndex);
       } else if (act === 'kill') {
-        const ok = await confirmDialog('结束进程？', '确认结束进程 <b style="color:var(--text-primary)">' + escapeHtml(h.name || h.pid) + '</b> (PID ' + h.pid + ') ？<br><span style="color:var(--accent-red)">将强制终止该进程并释放文件占用。</span>');
+        const isExp = isExplorer(h.name) || isExplorer(h.exe);
+        const promptTip = isExp 
+          ? '<br><span style="color:var(--accent-orange);font-size:12px">💡 提示：该进程为 Windows 资源管理器/桌面，结束后将自动为您重启桌面以防电脑异常。</span>'
+          : '<br><span style="color:var(--accent-red)">将强制终止该进程并释放文件占用。</span>';
+        const ok = await confirmDialog('结束进程？', '确认结束进程 <b style="color:var(--text-primary)">' + escapeHtml(h.name || h.pid) + '</b> (PID ' + h.pid + ') ？' + promptTip);
         if (!ok) return;
-        const res = await services.killProcess(h.pid, true);
-        toast(res.ok ? ('已结束进程：' + h.name) : ('结束失败：' + (res.message || '')), res.ok ? 'success' : 'error');
+        const res = await services.killProcess(h.pid, true, h.name || h.exe);
+        const msg = res.ok 
+          ? (res.restartedExplorer ? ('已结束资源管理器，正在自动重启桌面...') : ('已结束进程：' + h.name))
+          : ('结束失败：' + (res.message || ''));
+        toast(msg, res.ok ? 'success' : 'error', 3000);
         if (selectedIndex >= 0) await scanFile(selectedIndex);
       }
     });
@@ -618,6 +748,23 @@
 
   /* ---------- Wire up buttons ---------- */
   els.btnAdd.addEventListener('click', onAdd);
+  if (els.btnSyncSelected) {
+    els.btnSyncSelected.addEventListener('click', async () => {
+      if (services.getSelectedFiles) {
+        try {
+          const autoPaths = await services.getSelectedFiles();
+          if (autoPaths && autoPaths.length > 0) {
+            addPaths(autoPaths, true);
+            toast(`已刷新载入选中的 ${autoPaths.length} 项，正在检测占用...`, 'info', 2200);
+          } else {
+            toast('未检测到资源管理器或桌面上选中的文件', 'info', 2000);
+          }
+        } catch (e) {
+          toast('获取选中项失败: ' + e.message, 'error');
+        }
+      }
+    });
+  }
   els.btnRefreshAll.addEventListener('click', () => refreshAll());
   els.btnRefreshSel.addEventListener('click', () => { if (selectedIndex >= 0) scanFile(selectedIndex); });
   els.btnUnlock.addEventListener('click', () => { if (selectedIndex >= 0) unlockForFile(selectedIndex); });
@@ -644,13 +791,55 @@
   });
 
   /* ---------- Init ---------- */
-  adjustHeight();
+  adjustHeight(560);
+  setTimeout(() => adjustHeight(560), 80);
+  setTimeout(() => adjustHeight(560), 250);
   renderFiles();
   renderHolderPanel();
 
-  // 检查是否有由于加载时序暂存的 initialAction
-  if (services.getInitialAction) {
-    const initAction = services.getInitialAction();
-    if (initAction) window.onPluginEnter(initAction);
+  // 监听窗口聚焦与可见性变化，自动维持 560px
+  window.addEventListener('focus', () => {
+    adjustHeight(560);
+    setTimeout(() => adjustHeight(560), 80);
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      adjustHeight(560);
+      setTimeout(() => adjustHeight(560), 80);
+    }
+  });
+
+  // 消费所有挂起的 action 队列
+  if (services.getPendingActions) {
+    const pending = services.getPendingActions();
+    if (pending && pending.length) {
+      pending.forEach(act => window.onPluginEnter(act));
+    }
   }
+
+  // 双保险：直接尝试挂接全局 utools / ztools 监听
+  try {
+    const ut = (typeof utools !== 'undefined' ? utools : null) || window.utools || window.ztools;
+    if (ut && typeof ut.onPluginEnter === 'function') {
+      ut.onPluginEnter((action) => {
+        adjustHeight(560);
+        setTimeout(() => adjustHeight(560), 50);
+        setTimeout(() => adjustHeight(560), 150);
+        window.onPluginEnter(action);
+      });
+    }
+  } catch (e) {}
+
+  // 延迟 120ms 兜底：若列表仍为空，自动探测系统活动资源管理器/剪贴板选中的项
+  setTimeout(async () => {
+    if (files.length === 0 && services.getSelectedFiles) {
+      try {
+        const autoPaths = await services.getSelectedFiles();
+        if (autoPaths && autoPaths.length > 0) {
+          addPaths(autoPaths, true);
+          toast(`已自动检测并载入选中项（${autoPaths.length} 项）`, 'info', 2200);
+        }
+      } catch (e) {}
+    }
+  }, 120);
 })();

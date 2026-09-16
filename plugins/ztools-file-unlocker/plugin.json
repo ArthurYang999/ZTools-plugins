@@ -8,29 +8,23 @@
   "main": "index.html",
   "preload": "preload.js",
   "logo": "logo.png",
+  "unpack": "bin/**",
   "features": [
     {
       "code": "file-unlocker",
-      "explain": "文件解锁器 - 查找并解除文件占用",
+      "explain": "文件解锁器",
+      "icon": "logo.png",
       "cmds": [
         "文件解锁",
+        "文件解锁器",
+        "解锁",
         "解锁文件",
         "解除占用",
         "文件占用",
+        "查占用",
+        "强制删除",
         "unlock",
-        "unlocker",
-        {
-          "type": "files",
-          "label": "文件解锁",
-          "fileType": "file",
-          "minLength": 1
-        },
-        {
-          "type": "files",
-          "label": "解除文件夹占用",
-          "fileType": "directory",
-          "minLength": 1
-        }
+        "unlocker"
       ]
     }
   ],
